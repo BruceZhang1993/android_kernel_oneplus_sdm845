@@ -27,9 +27,6 @@ static int __bpf_mt_check_bytecode(struct sock_filter *insns, __u16 len,
 {
 	struct sock_fprog_kern program;
 
-	if (len > XT_BPF_MAX_NUM_INSTR)
-		return -EINVAL;
-
 	program.len = len;
 	program.filter = insns;
 
@@ -53,16 +50,6 @@ static int __bpf_mt_check_fd(int fd, struct bpf_prog **ret)
 	return 0;
 }
 
-static int __bpf_mt_check_path(const char *path, struct bpf_prog **ret)
-{
-	if (strnlen(path, XT_BPF_PATH_MAX) == XT_BPF_PATH_MAX)
-		return -EINVAL;
-
-	*ret = bpf_prog_get_type_path(path, BPF_PROG_TYPE_SOCKET_FILTER);
-	return PTR_ERR_OR_ZERO(*ret);
-
-}
-
 static int bpf_mt_check(const struct xt_mtchk_param *par)
 {
 	struct xt_bpf_info *info = par->matchinfo;
@@ -80,10 +67,9 @@ static int bpf_mt_check_v1(const struct xt_mtchk_param *par)
 		return __bpf_mt_check_bytecode(info->bpf_program,
 					       info->bpf_program_num_elem,
 					       &info->filter);
-	else if (info->mode == XT_BPF_MODE_FD_ELF)
+	else if (info->mode == XT_BPF_MODE_FD_PINNED ||
+		 info->mode == XT_BPF_MODE_FD_ELF)
 		return __bpf_mt_check_fd(info->fd, &info->filter);
-	else if (info->mode == XT_BPF_MODE_PATH_PINNED)
-		return __bpf_mt_check_path(info->path, &info->filter);
 	else
 		return -EINVAL;
 }
@@ -125,7 +111,6 @@ static struct xt_match bpf_mt_reg[] __read_mostly = {
 		.match		= bpf_mt,
 		.destroy	= bpf_mt_destroy,
 		.matchsize	= sizeof(struct xt_bpf_info),
-		.usersize	= offsetof(struct xt_bpf_info, filter),
 		.me		= THIS_MODULE,
 	},
 	{
@@ -136,7 +121,6 @@ static struct xt_match bpf_mt_reg[] __read_mostly = {
 		.match		= bpf_mt_v1,
 		.destroy	= bpf_mt_destroy_v1,
 		.matchsize	= sizeof(struct xt_bpf_info_v1),
-		.usersize	= offsetof(struct xt_bpf_info_v1, filter),
 		.me		= THIS_MODULE,
 	},
 };

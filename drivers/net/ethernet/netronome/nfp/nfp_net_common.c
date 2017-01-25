@@ -41,6 +41,8 @@
  *          Chris Telfer <chris.telfer@netronome.com>
  */
 
+#include <linux/bpf.h>
+#include <linux/bpf_trace.h>
 #include <linux/module.h>
 #include <linux/kernel.h>
 #include <linux/init.h>
@@ -1363,6 +1365,88 @@ nfp_net_parse_meta(struct net_device *netdev, struct sk_buff *skb,
 	return data;
 }
 
+static void
+nfp_net_rx_drop(struct nfp_net_r_vector *r_vec, struct nfp_net_rx_ring *rx_ring,
+		struct nfp_net_rx_buf *rxbuf, struct sk_buff *skb)
+{
+	u64_stats_update_begin(&r_vec->rx_sync);
+	r_vec->rx_drops++;
+	u64_stats_update_end(&r_vec->rx_sync);
+
+	/* skb is build based on the frag, free_skb() would free the frag
+	 * so to be able to reuse it we need an extra ref.
+	 */
+	if (skb && rxbuf && skb->head == rxbuf->frag)
+		page_ref_inc(virt_to_head_page(rxbuf->frag));
+	if (rxbuf)
+		nfp_net_rx_give_one(rx_ring, rxbuf->frag, rxbuf->dma_addr);
+	if (skb)
+		dev_kfree_skb_any(skb);
+}
+
+static bool
+nfp_net_tx_xdp_buf(struct nfp_net *nn, struct nfp_net_rx_ring *rx_ring,
+		   struct nfp_net_tx_ring *tx_ring,
+		   struct nfp_net_rx_buf *rxbuf, unsigned int pkt_off,
+		   unsigned int pkt_len)
+{
+	struct nfp_net_tx_buf *txbuf;
+	struct nfp_net_tx_desc *txd;
+	dma_addr_t new_dma_addr;
+	void *new_frag;
+	int wr_idx;
+
+	if (unlikely(nfp_net_tx_full(tx_ring, 1))) {
+		nfp_net_rx_drop(rx_ring->r_vec, rx_ring, rxbuf, NULL);
+		return false;
+	}
+
+	new_frag = nfp_net_napi_alloc_one(nn, DMA_BIDIRECTIONAL, &new_dma_addr);
+	if (unlikely(!new_frag)) {
+		nfp_net_rx_drop(rx_ring->r_vec, rx_ring, rxbuf, NULL);
+		return false;
+	}
+	nfp_net_rx_give_one(rx_ring, new_frag, new_dma_addr);
+
+	wr_idx = tx_ring->wr_p & (tx_ring->cnt - 1);
+
+	/* Stash the soft descriptor of the head then initialize it */
+	txbuf = &tx_ring->txbufs[wr_idx];
+	txbuf->frag = rxbuf->frag;
+	txbuf->dma_addr = rxbuf->dma_addr;
+	txbuf->fidx = -1;
+	txbuf->pkt_cnt = 1;
+	txbuf->real_len = pkt_len;
+
+	dma_sync_single_for_device(&nn->pdev->dev, rxbuf->dma_addr + pkt_off,
+				   pkt_len, DMA_TO_DEVICE);
+
+	/* Build TX descriptor */
+	txd = &tx_ring->txds[wr_idx];
+	txd->offset_eop = PCIE_DESC_TX_EOP;
+	txd->dma_len = cpu_to_le16(pkt_len);
+	nfp_desc_set_dma_addr(txd, rxbuf->dma_addr + pkt_off);
+	txd->data_len = cpu_to_le16(pkt_len);
+
+	txd->flags = 0;
+	txd->mss = 0;
+	txd->l4_offset = 0;
+
+	tx_ring->wr_p++;
+	tx_ring->wr_ptr_add++;
+	return true;
+}
+
+static int nfp_net_run_xdp(struct bpf_prog *prog, void *data, unsigned int len)
+{
+	struct xdp_buff xdp;
+
+	xdp.data = data;
+	xdp.data_end = data + len;
+
+	return bpf_prog_run_xdp(prog, &xdp);
+}
+
 /**
  * nfp_net_rx() - receive up to @budget packets on @rx_ring
  * @rx_ring:   RX ring to receive from
@@ -1482,6 +1566,55 @@ static int nfp_net_rx(struct nfp_net_rx_ring *rx_ring, int budget)
 		r_vec->rx_pkts++;
 		r_vec->rx_bytes += skb->len;
 		u64_stats_update_end(&r_vec->rx_sync);
+
+		if (xdp_prog && !(rxd->rxd.flags & PCIE_DESC_RX_BPF &&
+				  nn->bpf_offload_xdp)) {
+			int act;
+
+			dma_sync_single_for_cpu(&nn->pdev->dev,
+						rxbuf->dma_addr + pkt_off,
+						pkt_len, DMA_FROM_DEVICE);
+			act = nfp_net_run_xdp(xdp_prog, rxbuf->frag + data_off,
+					      pkt_len);
+			switch (act) {
+			case XDP_PASS:
+				break;
+			case XDP_TX:
+				if (unlikely(!nfp_net_tx_xdp_buf(nn, rx_ring,
+								 tx_ring, rxbuf,
+								 pkt_off, pkt_len)))
+					trace_xdp_exception(nn->netdev, xdp_prog, act);
+				continue;
+			default:
+				bpf_warn_invalid_xdp_action(act);
+			case XDP_ABORTED:
+				trace_xdp_exception(nn->netdev, xdp_prog, act);
+			case XDP_DROP:
+				nfp_net_rx_give_one(rx_ring, rxbuf->frag,
+						    rxbuf->dma_addr);
+				continue;
+			}
+		}
+
+		skb = build_skb(rxbuf->frag, true_bufsz);
+		if (unlikely(!skb)) {
+			nfp_net_rx_drop(r_vec, rx_ring, rxbuf, NULL);
+			continue;
+		}
+		new_frag = nfp_net_napi_alloc_one(nn, rx_dma_map_dir,
+						  &new_dma_addr);
+		if (unlikely(!new_frag)) {
+			nfp_net_rx_drop(r_vec, rx_ring, rxbuf, skb);
+			continue;
+		}
+
+		nfp_net_dma_unmap_rx(nn, rxbuf->dma_addr, nn->fl_bufsz,
+				     rx_dma_map_dir);
+
+		nfp_net_rx_give_one(rx_ring, new_frag, new_dma_addr);
+
+		skb_reserve(skb, data_off);
+		skb_put(skb, pkt_len);
 
 		if (nn->fw_ver.major <= 3) {
 			nfp_net_set_hash_desc(nn->netdev, skb, rxd);

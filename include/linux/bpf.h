@@ -173,9 +173,12 @@ struct bpf_verifier_ops {
 				enum bpf_reg_type *reg_type);
 	int (*gen_prologue)(struct bpf_insn *insn, bool direct_write,
 			    const struct bpf_prog *prog);
-	u32 (*convert_ctx_access)(enum bpf_access_type type, int dst_reg,
-				  int src_reg, int ctx_off,
-				  struct bpf_insn *insn, struct bpf_prog *prog);
+	u32 (*convert_ctx_access)(enum bpf_access_type type,
+				  const struct bpf_insn *src,
+				  struct bpf_insn *dst,
+				  struct bpf_prog *prog);
+	int (*test_run)(struct bpf_prog *prog, const union bpf_attr *kattr,
+			union bpf_attr __user *uattr);
 };
 
 struct bpf_prog_type_list {
@@ -242,57 +245,10 @@ typedef unsigned long (*bpf_ctx_copy_t)(void *dst, const void *src,
 u64 bpf_event_output(struct bpf_map *map, u64 flags, void *meta, u64 meta_size,
 		     void *ctx, u64 ctx_size, bpf_ctx_copy_t ctx_copy);
 
-/* an array of programs to be executed under rcu_lock.
- *
- * Typical usage:
- * ret = BPF_PROG_RUN_ARRAY(&bpf_prog_array, ctx, BPF_PROG_RUN);
- *
- * the structure returned by bpf_prog_array_alloc() should be populated
- * with program pointers and the last pointer must be NULL.
- * The user has to keep refcnt on the program and make sure the program
- * is removed from the array before bpf_prog_put().
- * The 'struct bpf_prog_array *' should only be replaced with xchg()
- * since other cpus are walking the array of pointers in parallel.
- */
-struct bpf_prog_array {
-	struct rcu_head rcu;
-	struct bpf_prog *progs[0];
-};
-
-struct bpf_prog_array *bpf_prog_array_alloc(u32 prog_cnt, gfp_t flags);
-void bpf_prog_array_free(struct bpf_prog_array __rcu *progs);
-
-void bpf_prog_array_delete_safe(struct bpf_prog_array __rcu *progs,
-				struct bpf_prog *old_prog);
-int bpf_prog_array_copy(struct bpf_prog_array __rcu *old_array,
-			struct bpf_prog *exclude_prog,
-			struct bpf_prog *include_prog,
-			struct bpf_prog_array **new_array);
-
-#define __BPF_PROG_RUN_ARRAY(array, ctx, func, check_non_null)	\
-	({						\
-		struct bpf_prog **_prog, *__prog;	\
-		struct bpf_prog_array *_array;		\
-		u32 _ret = 1;				\
-		rcu_read_lock();			\
-		_array = rcu_dereference(array);	\
-		if (unlikely(check_non_null && !_array))\
-			goto _out;			\
-		_prog = _array->progs;			\
-		while ((__prog = READ_ONCE(*_prog))) {	\
-			_ret &= func(__prog, ctx);	\
-			_prog++;			\
-		}					\
-_out:							\
-		rcu_read_unlock();			\
-		_ret;					\
-	 })
-
-#define BPF_PROG_RUN_ARRAY(array, ctx, func)		\
-	__BPF_PROG_RUN_ARRAY(array, ctx, func, false)
-
-#define BPF_PROG_RUN_ARRAY_CHECK(array, ctx, func)	\
-	__BPF_PROG_RUN_ARRAY(array, ctx, func, true)
+int bpf_prog_test_run_xdp(struct bpf_prog *prog, const union bpf_attr *kattr,
+			  union bpf_attr __user *uattr);
+int bpf_prog_test_run_skb(struct bpf_prog *prog, const union bpf_attr *kattr,
+			  union bpf_attr __user *uattr);
 
 #ifdef CONFIG_BPF_SYSCALL
 DECLARE_PER_CPU(int, bpf_prog_active);

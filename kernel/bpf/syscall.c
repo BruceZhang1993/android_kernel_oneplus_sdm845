@@ -22,8 +22,12 @@
 #include <linux/version.h>
 
 #define BPF_OBJ_FLAG_MASK   (BPF_F_RDONLY | BPF_F_WRONLY)
+#include <linux/kernel.h>
+#include <linux/idr.h>
 
 DEFINE_PER_CPU(int, bpf_prog_active);
+static DEFINE_IDR(prog_idr);
+static DEFINE_SPINLOCK(prog_idr_lock);
 
 int sysctl_unprivileged_bpf_disabled __read_mostly =
 	IS_BUILTIN(CONFIG_BPF_UNPRIV_DEFAULT_OFF) ? 2 : 0;
@@ -705,6 +709,34 @@ static void bpf_prog_uncharge_memlock(struct bpf_prog *prog)
 	free_uid(user);
 }
 
+static int bpf_prog_alloc_id(struct bpf_prog *prog)
+{
+	int id;
+
+	spin_lock_bh(&prog_idr_lock);
+	id = idr_alloc_cyclic(&prog_idr, prog, 1, INT_MAX, GFP_ATOMIC);
+	if (id > 0)
+		prog->aux->id = id;
+	spin_unlock_bh(&prog_idr_lock);
+
+	/* id is in [1, INT_MAX) */
+	if (WARN_ON_ONCE(!id))
+		return -ENOSPC;
+
+	return id > 0 ? 0 : id;
+}
+
+static void bpf_prog_free_id(struct bpf_prog *prog)
+{
+	/* cBPF to eBPF migrations are currently not in the idr store. */
+	if (!prog->aux->id)
+		return;
+
+	spin_lock_bh(&prog_idr_lock);
+	idr_remove(&prog_idr, prog->aux->id);
+	spin_unlock_bh(&prog_idr_lock);
+}
+
 static void __bpf_prog_put_rcu(struct rcu_head *rcu)
 {
 	struct bpf_prog_aux *aux = container_of(rcu, struct bpf_prog_aux, rcu);
@@ -719,6 +751,8 @@ void bpf_prog_put(struct bpf_prog *prog)
 {
 	if (atomic_dec_and_test(&prog->aux->refcnt)) {
 		trace_bpf_prog_put_rcu(prog);
+		bpf_prog_free_id(prog);
+		bpf_prog_kallsyms_del(prog);
 		call_rcu(&prog->aux->rcu, __bpf_prog_put_rcu);
 	}
 }
@@ -907,14 +941,20 @@ static int bpf_prog_load(union bpf_attr *attr)
 	if (err < 0)
 		goto free_used_maps;
 
+	err = bpf_prog_alloc_id(prog);
+	if (err)
+		goto free_used_maps;
+
 	err = bpf_prog_new_fd(prog);
 	if (err < 0)
 		/* failed to allocate fd */
-		goto free_used_maps;
+		goto free_id;
 
 	trace_bpf_prog_load(prog, err);
 	return err;
 
+free_id:
+	bpf_prog_free_id(prog);
 free_used_maps:
 	free_used_maps(prog->aux);
 free_prog:

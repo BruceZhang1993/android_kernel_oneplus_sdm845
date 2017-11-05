@@ -1,8 +1,27 @@
 #include <linux/fs.h>
+#include <linux/bpf-cgroup.h>
 
 #ifdef CONFIG_CGROUP_DEVICE
-extern int __devcgroup_inode_permission(struct inode *inode, int mask);
-extern int devcgroup_inode_mknod(int mode, dev_t dev);
+extern int __devcgroup_check_permission(short type, u32 major, u32 minor,
+					short access);
+#else
+static inline int __devcgroup_check_permission(short type, u32 major, u32 minor,
+					       short access)
+{ return 0; }
+#endif
+
+#if defined(CONFIG_CGROUP_DEVICE) || defined(CONFIG_CGROUP_BPF)
+static inline int devcgroup_check_permission(short type, u32 major, u32 minor,
+					     short access)
+{
+	int rc = BPF_CGROUP_RUN_PROG_DEVICE_CGROUP(type, major, minor, access);
+
+	if (rc)
+		return -EPERM;
+
+	return __devcgroup_check_permission(type, major, minor, access);
+}
+
 static inline int devcgroup_inode_permission(struct inode *inode, int mask)
 {
 	if (likely(!inode->i_rdev))

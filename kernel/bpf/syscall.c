@@ -990,6 +990,40 @@ static int bpf_obj_get(const union bpf_attr *attr)
 
 #define BPF_PROG_ATTACH_LAST_FIELD attach_flags
 
+static int sockmap_get_from_fd(const union bpf_attr *attr,
+			       int type, bool attach)
+{
+	struct bpf_prog *prog = NULL;
+	int ufd = attr->target_fd;
+	struct bpf_map *map;
+	struct fd f;
+	int err;
+
+	f = fdget(ufd);
+	map = __bpf_map_get(f);
+	if (IS_ERR(map))
+		return PTR_ERR(map);
+
+	if (attach) {
+		prog = bpf_prog_get_type(attr->attach_bpf_fd, type);
+		if (IS_ERR(prog)) {
+			fdput(f);
+			return PTR_ERR(prog);
+		}
+	}
+
+	err = sock_map_prog(map, prog, attr->attach_type);
+	if (err) {
+		fdput(f);
+		if (prog)
+			bpf_prog_put(prog);
+		return err;
+	}
+
+	fdput(f);
+	return 0;
+}
+
 #define BPF_F_ATTACH_MASK \
 	(BPF_F_ALLOW_OVERRIDE | BPF_F_ALLOW_MULTI)
 
@@ -1034,9 +1068,11 @@ static int bpf_prog_attach(const union bpf_attr *attr)
 	case BPF_CGROUP_DEVICE:
 		ptype = BPF_PROG_TYPE_CGROUP_DEVICE;
 		break;
+	case BPF_SK_MSG_VERDICT:
+		return sockmap_get_from_fd(attr, BPF_PROG_TYPE_SK_MSG, true);
 	case BPF_SK_SKB_STREAM_PARSER:
 	case BPF_SK_SKB_STREAM_VERDICT:
-		return sockmap_get_from_fd(attr, true);
+		return sockmap_get_from_fd(attr, BPF_PROG_TYPE_SK_SKB, true);
 	default:
 		return -EINVAL;
 	}
@@ -1074,9 +1110,11 @@ static int bpf_prog_detach(const union bpf_attr *attr)
 	case BPF_CGROUP_DEVICE:
 		ptype = BPF_PROG_TYPE_CGROUP_DEVICE;
 		break;
+	case BPF_SK_MSG_VERDICT:
+		return sockmap_get_from_fd(attr, BPF_PROG_TYPE_SK_MSG, false);
 	case BPF_SK_SKB_STREAM_PARSER:
 	case BPF_SK_SKB_STREAM_VERDICT:
-		return sockmap_get_from_fd(attr, false);
+		return sockmap_get_from_fd(attr, BPF_PROG_TYPE_SK_SKB, false);
 	default:
 		return -EINVAL;
 	}

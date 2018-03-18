@@ -442,8 +442,27 @@ struct xdp_buff {
 	void *data_end;
 };
 
-/* compute the linear packet data range [data, data_end) which
- * will be accessed by cls_bpf, act_bpf and lwt programs
+struct sk_msg_buff {
+	void *data;
+	void *data_end;
+	__u32 apply_bytes;
+	__u32 cork_bytes;
+	int sg_copybreak;
+	int sg_start;
+	int sg_curr;
+	int sg_end;
+	struct scatterlist sg_data[MAX_SKB_FRAGS];
+	bool sg_copy[MAX_SKB_FRAGS];
+	__u32 key;
+	__u32 flags;
+	struct bpf_map *map;
+};
+
+/* Compute the linear packet data range [data, data_end) which
+ * will be accessed by various program types (cls_bpf, act_bpf,
+ * lwt, ...). Subsystems allowing direct data access must (!)
+ * ensure that cb[] area can be written to when BPF program is
+ * invoked (otherwise cb[] save/restore is necessary).
  */
 static inline void bpf_compute_data_end(struct sk_buff *skb)
 {
@@ -600,6 +619,9 @@ bool bpf_helper_changes_skb_data(void *func);
 struct bpf_prog *bpf_patch_insn_single(struct bpf_prog *prog, u32 off,
 				       const struct bpf_insn *patch, u32 len);
 void bpf_warn_invalid_xdp_action(u32 act);
+
+struct sock *do_sk_redirect_map(struct sk_buff *skb);
+struct sock *do_msg_redirect_map(struct sk_msg_buff *md);
 
 #ifdef CONFIG_BPF_JIT
 extern int bpf_jit_enable;

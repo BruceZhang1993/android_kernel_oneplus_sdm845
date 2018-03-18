@@ -807,6 +807,8 @@ static bool may_access_direct_pkt_data(struct bpf_verifier_env *env,
 	case BPF_PROG_TYPE_SCHED_ACT:
 	case BPF_PROG_TYPE_XDP:
 	case BPF_PROG_TYPE_LWT_XMIT:
+	case BPF_PROG_TYPE_SK_SKB:
+	case BPF_PROG_TYPE_SK_MSG:
 		if (meta)
 			return meta->pkt_access;
 
@@ -1296,6 +1298,31 @@ static int check_map_func_compatibility(struct bpf_map *map, int func_id)
 		    func_id != BPF_FUNC_current_task_under_cgroup)
 			goto error;
 		break;
+	/* devmap returns a pointer to a live net_device ifindex that we cannot
+	 * allow to be modified from bpf side. So do not allow lookup elements
+	 * for now.
+	 */
+	case BPF_MAP_TYPE_DEVMAP:
+		if (func_id != BPF_FUNC_redirect_map)
+			goto error;
+		break;
+	/* Restrict bpf side of cpumap, open when use-cases appear */
+	case BPF_MAP_TYPE_CPUMAP:
+		if (func_id != BPF_FUNC_redirect_map)
+			goto error;
+		break;
+	case BPF_MAP_TYPE_ARRAY_OF_MAPS:
+	case BPF_MAP_TYPE_HASH_OF_MAPS:
+		if (func_id != BPF_FUNC_map_lookup_elem)
+			goto error;
+		break;
+	case BPF_MAP_TYPE_SOCKMAP:
+		if (func_id != BPF_FUNC_sk_redirect_map &&
+		    func_id != BPF_FUNC_sock_map_update &&
+		    func_id != BPF_FUNC_map_delete_elem &&
+		    func_id != BPF_FUNC_msg_redirect_map)
+			goto error;
+		break;
 	default:
 		break;
 	}
@@ -1318,6 +1345,20 @@ static int check_map_func_compatibility(struct bpf_map *map, int func_id)
 	case BPF_FUNC_current_task_under_cgroup:
 	case BPF_FUNC_skb_under_cgroup:
 		if (map->map_type != BPF_MAP_TYPE_CGROUP_ARRAY)
+			goto error;
+		break;
+	case BPF_FUNC_redirect_map:
+		if (map->map_type != BPF_MAP_TYPE_DEVMAP &&
+		    map->map_type != BPF_MAP_TYPE_CPUMAP)
+			goto error;
+		break;
+	case BPF_FUNC_sk_redirect_map:
+	case BPF_FUNC_msg_redirect_map:
+		if (map->map_type != BPF_MAP_TYPE_SOCKMAP)
+			goto error;
+		break;
+	case BPF_FUNC_sock_map_update:
+		if (map->map_type != BPF_MAP_TYPE_SOCKMAP)
 			goto error;
 		break;
 	default:

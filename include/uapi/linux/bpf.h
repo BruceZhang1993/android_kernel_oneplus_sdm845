@@ -129,6 +129,10 @@ enum bpf_attach_type {
 	BPF_SK_MSG_VERDICT,
 	BPF_CGROUP_INET4_BIND,
 	BPF_CGROUP_INET6_BIND,
+	BPF_CGROUP_INET4_CONNECT,
+	BPF_CGROUP_INET6_CONNECT,
+	BPF_CGROUP_INET4_POST_BIND,
+	BPF_CGROUP_INET6_POST_BIND,
 	__MAX_BPF_ATTACH_TYPE
 };
 
@@ -1154,6 +1158,26 @@ enum bpf_ret_code {
 	BPF_REDIRECT = 7,
 	/* >127 are reserved for prog type specific return codes */
 };
+
+struct bpf_sock {
+	__u32 bound_dev_if;
+	__u32 family;
+	__u32 type;
+	__u32 protocol;
+	__u32 mark;
+	__u32 priority;
+	__u32 src_ip4;		/* Allows 1,2,4-byte read.
+				 * Stored in network byte order.
+				 */
+	__u32 src_ip6[4];	/* Allows 1,2,4-byte read.
+				 * Stored in network byte order.
+				 */
+	__u32 src_port;		/* Allows 4-byte read.
+				 * Stored in host byte order
+				 */
+};
+
+#define XDP_PACKET_HEADROOM 256
 
 /* User return codes for XDP prog type.
  * A valid XDP program must return one of these defined values. All other

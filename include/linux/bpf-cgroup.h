@@ -81,17 +81,35 @@ int __cgroup_bpf_check_dev_permission(short dev_type, u32 major, u32 minor,
 	__ret;								      \
 })
 
-#define BPF_CGROUP_RUN_PROG_INET_EGRESS(sk,skb)				\
-({									\
-	int __ret = 0;							\
-	if (cgroup_bpf_enabled && sk && sk == skb->sk) {		\
-		typeof(sk) __sk = sk_to_full_sk(sk);			\
-		if (sk_fullsock(__sk))					\
-			__ret = __cgroup_bpf_run_filter(__sk, skb,	\
-						BPF_CGROUP_INET_EGRESS); \
-	}								\
-	__ret;								\
+#define BPF_CGROUP_RUN_PROG_INET_EGRESS(sk, skb)			       \
+({									       \
+	int __ret = 0;							       \
+	if (cgroup_bpf_enabled && sk && sk == skb->sk) {		       \
+		typeof(sk) __sk = sk_to_full_sk(sk);			       \
+		if (sk_fullsock(__sk))					       \
+			__ret = __cgroup_bpf_run_filter_skb(__sk, skb,	       \
+						      BPF_CGROUP_INET_EGRESS); \
+	}								       \
+	__ret;								       \
 })
+
+#define BPF_CGROUP_RUN_SK_PROG(sk, type)				       \
+({									       \
+	int __ret = 0;							       \
+	if (cgroup_bpf_enabled) {					       \
+		__ret = __cgroup_bpf_run_filter_sk(sk, type);		       \
+	}								       \
+	__ret;								       \
+})
+
+#define BPF_CGROUP_RUN_PROG_INET_SOCK(sk)				       \
+	BPF_CGROUP_RUN_SK_PROG(sk, BPF_CGROUP_INET_SOCK_CREATE)
+
+#define BPF_CGROUP_RUN_PROG_INET4_POST_BIND(sk)				       \
+	BPF_CGROUP_RUN_SK_PROG(sk, BPF_CGROUP_INET4_POST_BIND)
+
+#define BPF_CGROUP_RUN_PROG_INET6_POST_BIND(sk)				       \
+	BPF_CGROUP_RUN_SK_PROG(sk, BPF_CGROUP_INET6_POST_BIND)
 
 #define BPF_CGROUP_RUN_SA_PROG(sk, uaddr, type)				       \
 ({									       \
@@ -141,6 +159,12 @@ static inline int cgroup_bpf_inherit(struct cgroup *cgrp) { return 0; }
 #define BPF_CGROUP_RUN_PROG_INET_SOCK(sk) ({ 0; })
 #define BPF_CGROUP_RUN_PROG_INET4_BIND(sk, uaddr) ({ 0; })
 #define BPF_CGROUP_RUN_PROG_INET6_BIND(sk, uaddr) ({ 0; })
+#define BPF_CGROUP_RUN_PROG_INET4_POST_BIND(sk) ({ 0; })
+#define BPF_CGROUP_RUN_PROG_INET6_POST_BIND(sk) ({ 0; })
+#define BPF_CGROUP_RUN_PROG_INET4_CONNECT(sk, uaddr) ({ 0; })
+#define BPF_CGROUP_RUN_PROG_INET4_CONNECT_LOCK(sk, uaddr) ({ 0; })
+#define BPF_CGROUP_RUN_PROG_INET6_CONNECT(sk, uaddr) ({ 0; })
+#define BPF_CGROUP_RUN_PROG_INET6_CONNECT_LOCK(sk, uaddr) ({ 0; })
 #define BPF_CGROUP_RUN_PROG_SOCK_OPS(sock_ops) ({ 0; })
 #define BPF_CGROUP_RUN_PROG_DEVICE_CGROUP(type,major,minor,access) ({ 0; })
 

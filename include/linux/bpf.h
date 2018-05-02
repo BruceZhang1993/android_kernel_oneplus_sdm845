@@ -383,6 +383,114 @@ static inline bool unprivileged_ebpf_enabled(void)
 
 #endif /* CONFIG_BPF_SYSCALL */
 
+static inline struct bpf_prog *bpf_prog_get_type(u32 ufd,
+						 enum bpf_prog_type type)
+{
+	return bpf_prog_get_type_dev(ufd, type, false);
+}
+
+bool bpf_prog_get_ok(struct bpf_prog *, enum bpf_prog_type *, bool);
+
+int bpf_prog_offload_compile(struct bpf_prog *prog);
+void bpf_prog_offload_destroy(struct bpf_prog *prog);
+int bpf_prog_offload_info_fill(struct bpf_prog_info *info,
+			       struct bpf_prog *prog);
+
+int bpf_map_offload_info_fill(struct bpf_map_info *info, struct bpf_map *map);
+
+int bpf_map_offload_lookup_elem(struct bpf_map *map, void *key, void *value);
+int bpf_map_offload_update_elem(struct bpf_map *map,
+				void *key, void *value, u64 flags);
+int bpf_map_offload_delete_elem(struct bpf_map *map, void *key);
+int bpf_map_offload_get_next_key(struct bpf_map *map,
+				 void *key, void *next_key);
+
+bool bpf_offload_dev_match(struct bpf_prog *prog, struct bpf_map *map);
+
+#if defined(CONFIG_NET) && defined(CONFIG_BPF_SYSCALL)
+int bpf_prog_offload_init(struct bpf_prog *prog, union bpf_attr *attr);
+
+static inline bool bpf_prog_is_dev_bound(struct bpf_prog_aux *aux)
+{
+	return aux->offload_requested;
+}
+
+static inline bool bpf_map_is_dev_bound(struct bpf_map *map)
+{
+	return unlikely(map->ops == &bpf_map_offload_ops);
+}
+
+struct bpf_map *bpf_map_offload_map_alloc(union bpf_attr *attr);
+void bpf_map_offload_map_free(struct bpf_map *map);
+#else
+static inline int bpf_prog_offload_init(struct bpf_prog *prog,
+					union bpf_attr *attr)
+{
+	return -EOPNOTSUPP;
+}
+
+static inline bool bpf_prog_is_dev_bound(struct bpf_prog_aux *aux)
+{
+	return false;
+}
+
+static inline bool bpf_map_is_dev_bound(struct bpf_map *map)
+{
+	return false;
+}
+
+static inline struct bpf_map *bpf_map_offload_map_alloc(union bpf_attr *attr)
+{
+	return ERR_PTR(-EOPNOTSUPP);
+}
+
+static inline void bpf_map_offload_map_free(struct bpf_map *map)
+{
+}
+#endif /* CONFIG_NET && CONFIG_BPF_SYSCALL */
+
+#if defined(CONFIG_STREAM_PARSER) && defined(CONFIG_BPF_SYSCALL) && defined(CONFIG_INET)
+struct sock  *__sock_map_lookup_elem(struct bpf_map *map, u32 key);
+int sock_map_prog(struct bpf_map *map, struct bpf_prog *prog, u32 type);
+#else
+static inline struct sock  *__sock_map_lookup_elem(struct bpf_map *map, u32 key)
+{
+	return NULL;
+}
+
+static inline int sock_map_prog(struct bpf_map *map,
+				struct bpf_prog *prog,
+				u32 type)
+{
+	return -EOPNOTSUPP;
+}
+#endif
+
+#if defined(CONFIG_XDP_SOCKETS)
+struct xdp_sock;
+struct xdp_sock *__xsk_map_lookup_elem(struct bpf_map *map, u32 key);
+int __xsk_map_redirect(struct bpf_map *map, struct xdp_buff *xdp,
+		       struct xdp_sock *xs);
+void __xsk_map_flush(struct bpf_map *map);
+#else
+struct xdp_sock;
+static inline struct xdp_sock *__xsk_map_lookup_elem(struct bpf_map *map,
+						     u32 key)
+{
+	return NULL;
+}
+
+static inline int __xsk_map_redirect(struct bpf_map *map, struct xdp_buff *xdp,
+				     struct xdp_sock *xs)
+{
+	return -EOPNOTSUPP;
+}
+
+static inline void __xsk_map_flush(struct bpf_map *map)
+{
+}
+#endif
+
 /* verifier prototypes for helper functions called from eBPF programs */
 extern const struct bpf_func_proto bpf_map_lookup_elem_proto;
 extern const struct bpf_func_proto bpf_map_update_elem_proto;

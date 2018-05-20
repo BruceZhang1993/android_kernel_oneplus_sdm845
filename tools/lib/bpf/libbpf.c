@@ -1083,7 +1083,36 @@ bpf_object__load_progs(struct bpf_object *obj)
 
 static int bpf_object__validate(struct bpf_object *obj)
 {
-	if (obj->kern_version == 0) {
+	switch (type) {
+	case BPF_PROG_TYPE_SOCKET_FILTER:
+	case BPF_PROG_TYPE_SCHED_CLS:
+	case BPF_PROG_TYPE_SCHED_ACT:
+	case BPF_PROG_TYPE_XDP:
+	case BPF_PROG_TYPE_CGROUP_SKB:
+	case BPF_PROG_TYPE_CGROUP_SOCK:
+	case BPF_PROG_TYPE_LWT_IN:
+	case BPF_PROG_TYPE_LWT_OUT:
+	case BPF_PROG_TYPE_LWT_XMIT:
+	case BPF_PROG_TYPE_LWT_SEG6LOCAL:
+	case BPF_PROG_TYPE_SOCK_OPS:
+	case BPF_PROG_TYPE_SK_SKB:
+	case BPF_PROG_TYPE_CGROUP_DEVICE:
+	case BPF_PROG_TYPE_SK_MSG:
+	case BPF_PROG_TYPE_CGROUP_SOCK_ADDR:
+		return false;
+	case BPF_PROG_TYPE_UNSPEC:
+	case BPF_PROG_TYPE_KPROBE:
+	case BPF_PROG_TYPE_TRACEPOINT:
+	case BPF_PROG_TYPE_PERF_EVENT:
+	case BPF_PROG_TYPE_RAW_TRACEPOINT:
+	default:
+		return true;
+	}
+}
+
+static int bpf_object__validate(struct bpf_object *obj, bool needs_kver)
+{
+	if (needs_kver && obj->kern_version == 0) {
 		pr_warning("%s doesn't provide kernel version\n",
 			   obj->path);
 		return -LIBBPF_ERRNO__KVERSION;

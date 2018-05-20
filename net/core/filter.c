@@ -3231,7 +3231,24 @@ lwt_xmit_func_proto(enum bpf_func_id func_id)
 	}
 }
 
-static bool __is_valid_access(int off, int size, enum bpf_access_type type)
+static const struct bpf_func_proto *
+lwt_seg6local_func_proto(enum bpf_func_id func_id, const struct bpf_prog *prog)
+{
+	switch (func_id) {
+	case BPF_FUNC_lwt_seg6_store_bytes:
+		return &bpf_lwt_seg6_store_bytes_proto;
+	case BPF_FUNC_lwt_seg6_action:
+		return &bpf_lwt_seg6_action_proto;
+	case BPF_FUNC_lwt_seg6_adjust_srh:
+		return &bpf_lwt_seg6_adjust_srh_proto;
+	default:
+		return lwt_out_func_proto(func_id, prog);
+	}
+}
+
+static bool bpf_skb_is_valid_access(int off, int size, enum bpf_access_type type,
+				    const struct bpf_prog *prog,
+				    struct bpf_insn_access_aux *info)
 {
 	if (off < 0 || off >= sizeof(struct __sk_buff))
 		return false;
@@ -4384,9 +4401,20 @@ static const struct bpf_verifier_ops lwt_xmit_ops = {
 	.test_run		= bpf_prog_test_run_skb,
 };
 
-static struct bpf_prog_type_list sk_filter_type __read_mostly = {
-	.ops	= &sk_filter_verifier_ops,
-	.type	= BPF_PROG_TYPE_SOCKET_FILTER,
+const struct bpf_verifier_ops lwt_seg6local_verifier_ops = {
+	.get_func_proto		= lwt_seg6local_func_proto,
+	.is_valid_access	= lwt_is_valid_access,
+	.convert_ctx_access	= bpf_convert_ctx_access,
+};
+
+const struct bpf_prog_ops lwt_seg6local_prog_ops = {
+	.test_run		= bpf_prog_test_run_skb,
+};
+
+const struct bpf_verifier_ops cg_sock_verifier_ops = {
+	.get_func_proto		= sock_filter_func_proto,
+	.is_valid_access	= sock_filter_is_valid_access,
+	.convert_ctx_access	= sock_filter_convert_ctx_access,
 };
 
 const struct bpf_prog_ops cg_sock_prog_ops = {

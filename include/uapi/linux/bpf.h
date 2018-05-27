@@ -126,6 +126,7 @@ enum bpf_prog_type {
 	BPF_PROG_TYPE_RAW_TRACEPOINT,
 	BPF_PROG_TYPE_CGROUP_SOCK_ADDR,
 	BPF_PROG_TYPE_LWT_SEG6LOCAL,
+	BPF_PROG_TYPE_LIRC_MODE2,
 };
 
 enum bpf_attach_type {
@@ -143,6 +144,9 @@ enum bpf_attach_type {
 	BPF_CGROUP_INET6_CONNECT,
 	BPF_CGROUP_INET4_POST_BIND,
 	BPF_CGROUP_INET6_POST_BIND,
+	BPF_CGROUP_UDP4_SENDMSG,
+	BPF_CGROUP_UDP6_SENDMSG,
+	BPF_LIRC_MODE2,
 	__MAX_BPF_ATTACH_TYPE
 };
 
@@ -559,124 +563,745 @@ union bpf_attr {
  *     Return: 0 on success or negative on error
  *
  * int bpf_probe_read_str(void *dst, int size, const void *unsafe_ptr)
- *     Copy a NUL terminated string from unsafe address. In case the string
- *     length is smaller than size, the target is not padded with further NUL
- *     bytes. In case the string length is larger than size, just count-1
- *     bytes are copied and the last byte is set to NUL.
- *     @dst: destination address
- *     @size: maximum number of bytes to copy, including the trailing NUL
- *     @unsafe_ptr: unsafe address
- *     Return:
- *       > 0 length of the string including the trailing NUL on success
- *       < 0 error
+ * 	Description
+ * 		Copy a NUL terminated string from an unsafe address
+ * 		*unsafe_ptr* to *dst*. The *size* should include the
+ * 		terminating NUL byte. In case the string length is smaller than
+ * 		*size*, the target is not padded with further NUL bytes. If the
+ * 		string length is larger than *size*, just *size*-1 bytes are
+ * 		copied and the last byte is set to NUL.
  *
- * u64 bpf_get_socket_cookie(skb)
- *     Get the cookie for the socket stored inside sk_buff.
- *     @skb: pointer to skb
- *     Return: 8 Bytes non-decreasing number on success or 0 if the socket
- *     field is missing inside sk_buff
+ * 		On success, the length of the copied string is returned. This
+ * 		makes this helper useful in tracing programs for reading
+ * 		strings, and more importantly to get its length at runtime. See
+ * 		the following snippet:
  *
- * u32 bpf_get_socket_uid(skb)
- *     Get the owner uid of the socket stored inside sk_buff.
- *     @skb: pointer to skb
- *     Return: uid of the socket owner on success or overflowuid if failed.
+ * 		::
  *
- * u32 bpf_set_hash(skb, hash)
- *     Set full skb->hash.
- *     @skb: pointer to skb
- *     @hash: hash to set
+ * 			SEC("kprobe/sys_open")
+ * 			void bpf_sys_open(struct pt_regs *ctx)
+ * 			{
+ * 			        char buf[PATHLEN]; // PATHLEN is defined to 256
+ * 			        int res = bpf_probe_read_str(buf, sizeof(buf),
+ * 				                             ctx->di);
  *
- * int bpf_setsockopt(bpf_socket, level, optname, optval, optlen)
- *     Calls setsockopt. Not all opts are available, only those with
- *     integer optvals plus TCP_CONGESTION.
- *     Supported levels: SOL_SOCKET and IPPROTO_TCP
- *     @bpf_socket: pointer to bpf_socket
- *     @level: SOL_SOCKET or IPPROTO_TCP
- *     @optname: option name
- *     @optval: pointer to option value
- *     @optlen: length of optval in bytes
- *     Return: 0 or negative error
+ * 				// Consume buf, for example push it to
+ * 				// userspace via bpf_perf_event_output(); we
+ * 				// can use res (the string length) as event
+ * 				// size, after checking its boundaries.
+ * 			}
  *
- * int bpf_getsockopt(bpf_socket, level, optname, optval, optlen)
- *     Calls getsockopt. Not all opts are available.
- *     Supported levels: IPPROTO_TCP
- *     @bpf_socket: pointer to bpf_socket
- *     @level: IPPROTO_TCP
- *     @optname: option name
- *     @optval: pointer to option value
- *     @optlen: length of optval in bytes
- *     Return: 0 or negative error
+ * 		In comparison, using **bpf_probe_read()** helper here instead
+ * 		to read the string would require to estimate the length at
+ * 		compile time, and would often result in copying more memory
+ * 		than necessary.
  *
- * int bpf_sock_ops_cb_flags_set(bpf_sock_ops, flags)
- *     Set callback flags for sock_ops
- *     @bpf_sock_ops: pointer to bpf_sock_ops_kern struct
- *     @flags: flags value
- *     Return: 0 for no error
- *             -EINVAL if there is no full tcp socket
- *             bits in flags that are not supported by current kernel
+ * 		Another useful use case is when parsing individual process
+ * 		arguments or individual environment variables navigating
+ * 		*current*\ **->mm->arg_start** and *current*\
+ * 		**->mm->env_start**: using this helper and the return value,
+ * 		one can quickly iterate at the right offset of the memory area.
+ * 	Return
+ * 		On success, the strictly positive length of the string,
+ * 		including the trailing NUL character. On error, a negative
+ * 		value.
  *
- * int bpf_skb_adjust_room(skb, len_diff, mode, flags)
- *     Grow or shrink room in sk_buff.
- *     @skb: pointer to skb
- *     @len_diff: (signed) amount of room to grow/shrink
- *     @mode: operation mode (enum bpf_adj_room_mode)
- *     @flags: reserved for future use
- *     Return: 0 on success or negative error code
+ * u64 bpf_get_socket_cookie(struct sk_buff *skb)
+ * 	Description
+ * 		If the **struct sk_buff** pointed by *skb* has a known socket,
+ * 		retrieve the cookie (generated by the kernel) of this socket.
+ * 		If no cookie has been set yet, generate a new cookie. Once
+ * 		generated, the socket cookie remains stable for the life of the
+ * 		socket. This helper can be useful for monitoring per socket
+ * 		networking traffic statistics as it provides a unique socket
+ * 		identifier per namespace.
+ * 	Return
+ * 		A 8-byte long non-decreasing number on success, or 0 if the
+ * 		socket field is missing inside *skb*.
  *
- * int bpf_sk_redirect_map(map, key, flags)
- *     Redirect skb to a sock in map using key as a lookup key for the
- *     sock in map.
- *     @map: pointer to sockmap
- *     @key: key to lookup sock in map
- *     @flags: reserved for future use
- *     Return: SK_PASS
+ * u32 bpf_get_socket_uid(struct sk_buff *skb)
+ * 	Return
+ * 		The owner UID of the socket associated to *skb*. If the socket
+ * 		is **NULL**, or if it is not a full socket (i.e. if it is a
+ * 		time-wait or a request socket instead), **overflowuid** value
+ * 		is returned (note that **overflowuid** might also be the actual
+ * 		UID value for the socket).
  *
- * int bpf_sock_map_update(skops, map, key, flags)
- *	@skops: pointer to bpf_sock_ops
- *	@map: pointer to sockmap to update
- *	@key: key to insert/update sock in map
- *	@flags: same flags as map update elem
+ * u32 bpf_set_hash(struct sk_buff *skb, u32 hash)
+ * 	Description
+ * 		Set the full hash for *skb* (set the field *skb*\ **->hash**)
+ * 		to value *hash*.
+ * 	Return
+ * 		0
  *
- * int bpf_xdp_adjust_meta(xdp_md, delta)
- *     Adjust the xdp_md.data_meta by delta
- *     @xdp_md: pointer to xdp_md
- *     @delta: An positive/negative integer to be added to xdp_md.data_meta
- *     Return: 0 on success or negative on error
+ * int bpf_setsockopt(struct bpf_sock_ops *bpf_socket, int level, int optname, char *optval, int optlen)
+ * 	Description
+ * 		Emulate a call to **setsockopt()** on the socket associated to
+ * 		*bpf_socket*, which must be a full socket. The *level* at
+ * 		which the option resides and the name *optname* of the option
+ * 		must be specified, see **setsockopt(2)** for more information.
+ * 		The option value of length *optlen* is pointed by *optval*.
  *
- * int bpf_perf_event_read_value(map, flags, buf, buf_size)
- *     read perf event counter value and perf event enabled/running time
- *     @map: pointer to perf_event_array map
- *     @flags: index of event in the map or bitmask flags
- *     @buf: buf to fill
- *     @buf_size: size of the buf
- *     Return: 0 on success or negative error code
+ * 		This helper actually implements a subset of **setsockopt()**.
+ * 		It supports the following *level*\ s:
  *
- * int bpf_perf_prog_read_value(ctx, buf, buf_size)
- *     read perf prog attached perf event counter and enabled/running time
- *     @ctx: pointer to ctx
- *     @buf: buf to fill
- *     @buf_size: size of the buf
- *     Return : 0 on success or negative error code
+ * 		* **SOL_SOCKET**, which supports the following *optname*\ s:
+ * 		  **SO_RCVBUF**, **SO_SNDBUF**, **SO_MAX_PACING_RATE**,
+ * 		  **SO_PRIORITY**, **SO_RCVLOWAT**, **SO_MARK**.
+ * 		* **IPPROTO_TCP**, which supports the following *optname*\ s:
+ * 		  **TCP_CONGESTION**, **TCP_BPF_IW**,
+ * 		  **TCP_BPF_SNDCWND_CLAMP**.
+ * 		* **IPPROTO_IP**, which supports *optname* **IP_TOS**.
+ * 		* **IPPROTO_IPV6**, which supports *optname* **IPV6_TCLASS**.
+ * 	Return
+ * 		0 on success, or a negative error in case of failure.
  *
- * int bpf_override_return(pt_regs, rc)
- *	@pt_regs: pointer to struct pt_regs
- *	@rc: the return value to set
+ * int bpf_skb_adjust_room(struct sk_buff *skb, u32 len_diff, u32 mode, u64 flags)
+ * 	Description
+ * 		Grow or shrink the room for data in the packet associated to
+ * 		*skb* by *len_diff*, and according to the selected *mode*.
  *
- * int bpf_msg_redirect_map(map, key, flags)
- *     Redirect msg to a sock in map using key as a lookup key for the
- *     sock in map.
- *     @map: pointer to sockmap
- *     @key: key to lookup sock in map
- *     @flags: reserved for future use
- *     Return: SK_PASS
+ * 		There is a single supported mode at this time:
  *
- * int bpf_bind(ctx, addr, addr_len)
- *     Bind socket to address. Only binding to IP is supported, no port can be
- *     set in addr.
- *     @ctx: pointer to context of type bpf_sock_addr
- *     @addr: pointer to struct sockaddr to bind socket to
- *     @addr_len: length of sockaddr structure
- *     Return: 0 on success or negative error code
+ * 		* **BPF_ADJ_ROOM_NET**: Adjust room at the network layer
+ * 		  (room space is added or removed below the layer 3 header).
+ *
+ * 		All values for *flags* are reserved for future usage, and must
+ * 		be left at zero.
+ *
+ * 		A call to this helper is susceptible to change the underlaying
+ * 		packet buffer. Therefore, at load time, all checks on pointers
+ * 		previously done by the verifier are invalidated and must be
+ * 		performed again, if the helper is used in combination with
+ * 		direct packet access.
+ * 	Return
+ * 		0 on success, or a negative error in case of failure.
+ *
+ * int bpf_redirect_map(struct bpf_map *map, u32 key, u64 flags)
+ * 	Description
+ * 		Redirect the packet to the endpoint referenced by *map* at
+ * 		index *key*. Depending on its type, this *map* can contain
+ * 		references to net devices (for forwarding packets through other
+ * 		ports), or to CPUs (for redirecting XDP frames to another CPU;
+ * 		but this is only implemented for native XDP (with driver
+ * 		support) as of this writing).
+ *
+ * 		All values for *flags* are reserved for future usage, and must
+ * 		be left at zero.
+ *
+ * 		When used to redirect packets to net devices, this helper
+ * 		provides a high performance increase over **bpf_redirect**\ ().
+ * 		This is due to various implementation details of the underlying
+ * 		mechanisms, one of which is the fact that **bpf_redirect_map**\
+ * 		() tries to send packet as a "bulk" to the device.
+ * 	Return
+ * 		**XDP_REDIRECT** on success, or **XDP_ABORTED** on error.
+ *
+ * int bpf_sk_redirect_map(struct bpf_map *map, u32 key, u64 flags)
+ * 	Description
+ * 		Redirect the packet to the socket referenced by *map* (of type
+ * 		**BPF_MAP_TYPE_SOCKMAP**) at index *key*. Both ingress and
+ * 		egress interfaces can be used for redirection. The
+ * 		**BPF_F_INGRESS** value in *flags* is used to make the
+ * 		distinction (ingress path is selected if the flag is present,
+ * 		egress path otherwise). This is the only flag supported for now.
+ * 	Return
+ * 		**SK_PASS** on success, or **SK_DROP** on error.
+ *
+ * int bpf_sock_map_update(struct bpf_sock_ops *skops, struct bpf_map *map, void *key, u64 flags)
+ * 	Description
+ * 		Add an entry to, or update a *map* referencing sockets. The
+ * 		*skops* is used as a new value for the entry associated to
+ * 		*key*. *flags* is one of:
+ *
+ * 		**BPF_NOEXIST**
+ * 			The entry for *key* must not exist in the map.
+ * 		**BPF_EXIST**
+ * 			The entry for *key* must already exist in the map.
+ * 		**BPF_ANY**
+ * 			No condition on the existence of the entry for *key*.
+ *
+ * 		If the *map* has eBPF programs (parser and verdict), those will
+ * 		be inherited by the socket being added. If the socket is
+ * 		already attached to eBPF programs, this results in an error.
+ * 	Return
+ * 		0 on success, or a negative error in case of failure.
+ *
+ * int bpf_xdp_adjust_meta(struct xdp_buff *xdp_md, int delta)
+ * 	Description
+ * 		Adjust the address pointed by *xdp_md*\ **->data_meta** by
+ * 		*delta* (which can be positive or negative). Note that this
+ * 		operation modifies the address stored in *xdp_md*\ **->data**,
+ * 		so the latter must be loaded only after the helper has been
+ * 		called.
+ *
+ * 		The use of *xdp_md*\ **->data_meta** is optional and programs
+ * 		are not required to use it. The rationale is that when the
+ * 		packet is processed with XDP (e.g. as DoS filter), it is
+ * 		possible to push further meta data along with it before passing
+ * 		to the stack, and to give the guarantee that an ingress eBPF
+ * 		program attached as a TC classifier on the same device can pick
+ * 		this up for further post-processing. Since TC works with socket
+ * 		buffers, it remains possible to set from XDP the **mark** or
+ * 		**priority** pointers, or other pointers for the socket buffer.
+ * 		Having this scratch space generic and programmable allows for
+ * 		more flexibility as the user is free to store whatever meta
+ * 		data they need.
+ *
+ * 		A call to this helper is susceptible to change the underlaying
+ * 		packet buffer. Therefore, at load time, all checks on pointers
+ * 		previously done by the verifier are invalidated and must be
+ * 		performed again, if the helper is used in combination with
+ * 		direct packet access.
+ * 	Return
+ * 		0 on success, or a negative error in case of failure.
+ *
+ * int bpf_perf_event_read_value(struct bpf_map *map, u64 flags, struct bpf_perf_event_value *buf, u32 buf_size)
+ * 	Description
+ * 		Read the value of a perf event counter, and store it into *buf*
+ * 		of size *buf_size*. This helper relies on a *map* of type
+ * 		**BPF_MAP_TYPE_PERF_EVENT_ARRAY**. The nature of the perf event
+ * 		counter is selected when *map* is updated with perf event file
+ * 		descriptors. The *map* is an array whose size is the number of
+ * 		available CPUs, and each cell contains a value relative to one
+ * 		CPU. The value to retrieve is indicated by *flags*, that
+ * 		contains the index of the CPU to look up, masked with
+ * 		**BPF_F_INDEX_MASK**. Alternatively, *flags* can be set to
+ * 		**BPF_F_CURRENT_CPU** to indicate that the value for the
+ * 		current CPU should be retrieved.
+ *
+ * 		This helper behaves in a way close to
+ * 		**bpf_perf_event_read**\ () helper, save that instead of
+ * 		just returning the value observed, it fills the *buf*
+ * 		structure. This allows for additional data to be retrieved: in
+ * 		particular, the enabled and running times (in *buf*\
+ * 		**->enabled** and *buf*\ **->running**, respectively) are
+ * 		copied. In general, **bpf_perf_event_read_value**\ () is
+ * 		recommended over **bpf_perf_event_read**\ (), which has some
+ * 		ABI issues and provides fewer functionalities.
+ *
+ * 		These values are interesting, because hardware PMU (Performance
+ * 		Monitoring Unit) counters are limited resources. When there are
+ * 		more PMU based perf events opened than available counters,
+ * 		kernel will multiplex these events so each event gets certain
+ * 		percentage (but not all) of the PMU time. In case that
+ * 		multiplexing happens, the number of samples or counter value
+ * 		will not reflect the case compared to when no multiplexing
+ * 		occurs. This makes comparison between different runs difficult.
+ * 		Typically, the counter value should be normalized before
+ * 		comparing to other experiments. The usual normalization is done
+ * 		as follows.
+ *
+ * 		::
+ *
+ * 			normalized_counter = counter * t_enabled / t_running
+ *
+ * 		Where t_enabled is the time enabled for event and t_running is
+ * 		the time running for event since last normalization. The
+ * 		enabled and running times are accumulated since the perf event
+ * 		open. To achieve scaling factor between two invocations of an
+ * 		eBPF program, users can can use CPU id as the key (which is
+ * 		typical for perf array usage model) to remember the previous
+ * 		value and do the calculation inside the eBPF program.
+ * 	Return
+ * 		0 on success, or a negative error in case of failure.
+ *
+ * int bpf_perf_prog_read_value(struct bpf_perf_event_data *ctx, struct bpf_perf_event_value *buf, u32 buf_size)
+ * 	Description
+ * 		For en eBPF program attached to a perf event, retrieve the
+ * 		value of the event counter associated to *ctx* and store it in
+ * 		the structure pointed by *buf* and of size *buf_size*. Enabled
+ * 		and running times are also stored in the structure (see
+ * 		description of helper **bpf_perf_event_read_value**\ () for
+ * 		more details).
+ * 	Return
+ * 		0 on success, or a negative error in case of failure.
+ *
+ * int bpf_getsockopt(struct bpf_sock_ops *bpf_socket, int level, int optname, char *optval, int optlen)
+ * 	Description
+ * 		Emulate a call to **getsockopt()** on the socket associated to
+ * 		*bpf_socket*, which must be a full socket. The *level* at
+ * 		which the option resides and the name *optname* of the option
+ * 		must be specified, see **getsockopt(2)** for more information.
+ * 		The retrieved value is stored in the structure pointed by
+ * 		*opval* and of length *optlen*.
+ *
+ * 		This helper actually implements a subset of **getsockopt()**.
+ * 		It supports the following *level*\ s:
+ *
+ * 		* **IPPROTO_TCP**, which supports *optname*
+ * 		  **TCP_CONGESTION**.
+ * 		* **IPPROTO_IP**, which supports *optname* **IP_TOS**.
+ * 		* **IPPROTO_IPV6**, which supports *optname* **IPV6_TCLASS**.
+ * 	Return
+ * 		0 on success, or a negative error in case of failure.
+ *
+ * int bpf_override_return(struct pt_reg *regs, u64 rc)
+ * 	Description
+ * 		Used for error injection, this helper uses kprobes to override
+ * 		the return value of the probed function, and to set it to *rc*.
+ * 		The first argument is the context *regs* on which the kprobe
+ * 		works.
+ *
+ * 		This helper works by setting setting the PC (program counter)
+ * 		to an override function which is run in place of the original
+ * 		probed function. This means the probed function is not run at
+ * 		all. The replacement function just returns with the required
+ * 		value.
+ *
+ * 		This helper has security implications, and thus is subject to
+ * 		restrictions. It is only available if the kernel was compiled
+ * 		with the **CONFIG_BPF_KPROBE_OVERRIDE** configuration
+ * 		option, and in this case it only works on functions tagged with
+ * 		**ALLOW_ERROR_INJECTION** in the kernel code.
+ *
+ * 		Also, the helper is only available for the architectures having
+ * 		the CONFIG_FUNCTION_ERROR_INJECTION option. As of this writing,
+ * 		x86 architecture is the only one to support this feature.
+ * 	Return
+ * 		0
+ *
+ * int bpf_sock_ops_cb_flags_set(struct bpf_sock_ops *bpf_sock, int argval)
+ * 	Description
+ * 		Attempt to set the value of the **bpf_sock_ops_cb_flags** field
+ * 		for the full TCP socket associated to *bpf_sock_ops* to
+ * 		*argval*.
+ *
+ * 		The primary use of this field is to determine if there should
+ * 		be calls to eBPF programs of type
+ * 		**BPF_PROG_TYPE_SOCK_OPS** at various points in the TCP
+ * 		code. A program of the same type can change its value, per
+ * 		connection and as necessary, when the connection is
+ * 		established. This field is directly accessible for reading, but
+ * 		this helper must be used for updates in order to return an
+ * 		error if an eBPF program tries to set a callback that is not
+ * 		supported in the current kernel.
+ *
+ * 		The supported callback values that *argval* can combine are:
+ *
+ * 		* **BPF_SOCK_OPS_RTO_CB_FLAG** (retransmission time out)
+ * 		* **BPF_SOCK_OPS_RETRANS_CB_FLAG** (retransmission)
+ * 		* **BPF_SOCK_OPS_STATE_CB_FLAG** (TCP state change)
+ *
+ * 		Here are some examples of where one could call such eBPF
+ * 		program:
+ *
+ * 		* When RTO fires.
+ * 		* When a packet is retransmitted.
+ * 		* When the connection terminates.
+ * 		* When a packet is sent.
+ * 		* When a packet is received.
+ * 	Return
+ * 		Code **-EINVAL** if the socket is not a full TCP socket;
+ * 		otherwise, a positive number containing the bits that could not
+ * 		be set is returned (which comes down to 0 if all bits were set
+ * 		as required).
+ *
+ * int bpf_msg_redirect_map(struct sk_msg_buff *msg, struct bpf_map *map, u32 key, u64 flags)
+ * 	Description
+ * 		This helper is used in programs implementing policies at the
+ * 		socket level. If the message *msg* is allowed to pass (i.e. if
+ * 		the verdict eBPF program returns **SK_PASS**), redirect it to
+ * 		the socket referenced by *map* (of type
+ * 		**BPF_MAP_TYPE_SOCKMAP**) at index *key*. Both ingress and
+ * 		egress interfaces can be used for redirection. The
+ * 		**BPF_F_INGRESS** value in *flags* is used to make the
+ * 		distinction (ingress path is selected if the flag is present,
+ * 		egress path otherwise). This is the only flag supported for now.
+ * 	Return
+ * 		**SK_PASS** on success, or **SK_DROP** on error.
+ *
+ * int bpf_msg_apply_bytes(struct sk_msg_buff *msg, u32 bytes)
+ * 	Description
+ * 		For socket policies, apply the verdict of the eBPF program to
+ * 		the next *bytes* (number of bytes) of message *msg*.
+ *
+ * 		For example, this helper can be used in the following cases:
+ *
+ * 		* A single **sendmsg**\ () or **sendfile**\ () system call
+ * 		  contains multiple logical messages that the eBPF program is
+ * 		  supposed to read and for which it should apply a verdict.
+ * 		* An eBPF program only cares to read the first *bytes* of a
+ * 		  *msg*. If the message has a large payload, then setting up
+ * 		  and calling the eBPF program repeatedly for all bytes, even
+ * 		  though the verdict is already known, would create unnecessary
+ * 		  overhead.
+ *
+ * 		When called from within an eBPF program, the helper sets a
+ * 		counter internal to the BPF infrastructure, that is used to
+ * 		apply the last verdict to the next *bytes*. If *bytes* is
+ * 		smaller than the current data being processed from a
+ * 		**sendmsg**\ () or **sendfile**\ () system call, the first
+ * 		*bytes* will be sent and the eBPF program will be re-run with
+ * 		the pointer for start of data pointing to byte number *bytes*
+ * 		**+ 1**. If *bytes* is larger than the current data being
+ * 		processed, then the eBPF verdict will be applied to multiple
+ * 		**sendmsg**\ () or **sendfile**\ () calls until *bytes* are
+ * 		consumed.
+ *
+ * 		Note that if a socket closes with the internal counter holding
+ * 		a non-zero value, this is not a problem because data is not
+ * 		being buffered for *bytes* and is sent as it is received.
+ * 	Return
+ * 		0
+ *
+ * int bpf_msg_cork_bytes(struct sk_msg_buff *msg, u32 bytes)
+ * 	Description
+ * 		For socket policies, prevent the execution of the verdict eBPF
+ * 		program for message *msg* until *bytes* (byte number) have been
+ * 		accumulated.
+ *
+ * 		This can be used when one needs a specific number of bytes
+ * 		before a verdict can be assigned, even if the data spans
+ * 		multiple **sendmsg**\ () or **sendfile**\ () calls. The extreme
+ * 		case would be a user calling **sendmsg**\ () repeatedly with
+ * 		1-byte long message segments. Obviously, this is bad for
+ * 		performance, but it is still valid. If the eBPF program needs
+ * 		*bytes* bytes to validate a header, this helper can be used to
+ * 		prevent the eBPF program to be called again until *bytes* have
+ * 		been accumulated.
+ * 	Return
+ * 		0
+ *
+ * int bpf_msg_pull_data(struct sk_msg_buff *msg, u32 start, u32 end, u64 flags)
+ * 	Description
+ * 		For socket policies, pull in non-linear data from user space
+ * 		for *msg* and set pointers *msg*\ **->data** and *msg*\
+ * 		**->data_end** to *start* and *end* bytes offsets into *msg*,
+ * 		respectively.
+ *
+ * 		If a program of type **BPF_PROG_TYPE_SK_MSG** is run on a
+ * 		*msg* it can only parse data that the (**data**, **data_end**)
+ * 		pointers have already consumed. For **sendmsg**\ () hooks this
+ * 		is likely the first scatterlist element. But for calls relying
+ * 		on the **sendpage** handler (e.g. **sendfile**\ ()) this will
+ * 		be the range (**0**, **0**) because the data is shared with
+ * 		user space and by default the objective is to avoid allowing
+ * 		user space to modify data while (or after) eBPF verdict is
+ * 		being decided. This helper can be used to pull in data and to
+ * 		set the start and end pointer to given values. Data will be
+ * 		copied if necessary (i.e. if data was not linear and if start
+ * 		and end pointers do not point to the same chunk).
+ *
+ * 		A call to this helper is susceptible to change the underlaying
+ * 		packet buffer. Therefore, at load time, all checks on pointers
+ * 		previously done by the verifier are invalidated and must be
+ * 		performed again, if the helper is used in combination with
+ * 		direct packet access.
+ *
+ * 		All values for *flags* are reserved for future usage, and must
+ * 		be left at zero.
+ * 	Return
+ * 		0 on success, or a negative error in case of failure.
+ *
+ * int bpf_bind(struct bpf_sock_addr *ctx, struct sockaddr *addr, int addr_len)
+ * 	Description
+ * 		Bind the socket associated to *ctx* to the address pointed by
+ * 		*addr*, of length *addr_len*. This allows for making outgoing
+ * 		connection from the desired IP address, which can be useful for
+ * 		example when all processes inside a cgroup should use one
+ * 		single IP address on a host that has multiple IP configured.
+ *
+ * 		This helper works for IPv4 and IPv6, TCP and UDP sockets. The
+ * 		domain (*addr*\ **->sa_family**) must be **AF_INET** (or
+ * 		**AF_INET6**). Looking for a free port to bind to can be
+ * 		expensive, therefore binding to port is not permitted by the
+ * 		helper: *addr*\ **->sin_port** (or **sin6_port**, respectively)
+ * 		must be set to zero.
+ * 	Return
+ * 		0 on success, or a negative error in case of failure.
+ *
+ * int bpf_xdp_adjust_tail(struct xdp_buff *xdp_md, int delta)
+ * 	Description
+ * 		Adjust (move) *xdp_md*\ **->data_end** by *delta* bytes. It is
+ * 		only possible to shrink the packet as of this writing,
+ * 		therefore *delta* must be a negative integer.
+ *
+ * 		A call to this helper is susceptible to change the underlaying
+ * 		packet buffer. Therefore, at load time, all checks on pointers
+ * 		previously done by the verifier are invalidated and must be
+ * 		performed again, if the helper is used in combination with
+ * 		direct packet access.
+ * 	Return
+ * 		0 on success, or a negative error in case of failure.
+ *
+ * int bpf_skb_get_xfrm_state(struct sk_buff *skb, u32 index, struct bpf_xfrm_state *xfrm_state, u32 size, u64 flags)
+ * 	Description
+ * 		Retrieve the XFRM state (IP transform framework, see also
+ * 		**ip-xfrm(8)**) at *index* in XFRM "security path" for *skb*.
+ *
+ * 		The retrieved value is stored in the **struct bpf_xfrm_state**
+ * 		pointed by *xfrm_state* and of length *size*.
+ *
+ * 		All values for *flags* are reserved for future usage, and must
+ * 		be left at zero.
+ *
+ * 		This helper is available only if the kernel was compiled with
+ * 		**CONFIG_XFRM** configuration option.
+ * 	Return
+ * 		0 on success, or a negative error in case of failure.
+ *
+ * int bpf_get_stack(struct pt_regs *regs, void *buf, u32 size, u64 flags)
+ * 	Description
+ * 		Return a user or a kernel stack in bpf program provided buffer.
+ * 		To achieve this, the helper needs *ctx*, which is a pointer
+ * 		to the context on which the tracing program is executed.
+ * 		To store the stacktrace, the bpf program provides *buf* with
+ * 		a nonnegative *size*.
+ *
+ * 		The last argument, *flags*, holds the number of stack frames to
+ * 		skip (from 0 to 255), masked with
+ * 		**BPF_F_SKIP_FIELD_MASK**. The next bits can be used to set
+ * 		the following flags:
+ *
+ * 		**BPF_F_USER_STACK**
+ * 			Collect a user space stack instead of a kernel stack.
+ * 		**BPF_F_USER_BUILD_ID**
+ * 			Collect buildid+offset instead of ips for user stack,
+ * 			only valid if **BPF_F_USER_STACK** is also specified.
+ *
+ * 		**bpf_get_stack**\ () can collect up to
+ * 		**PERF_MAX_STACK_DEPTH** both kernel and user frames, subject
+ * 		to sufficient large buffer size. Note that
+ * 		this limit can be controlled with the **sysctl** program, and
+ * 		that it should be manually increased in order to profile long
+ * 		user stacks (such as stacks for Java programs). To do so, use:
+ *
+ * 		::
+ *
+ * 			# sysctl kernel.perf_event_max_stack=<new value>
+ * 	Return
+ * 		A non-negative value equal to or less than *size* on success,
+ * 		or a negative error in case of failure.
+ *
+ * int skb_load_bytes_relative(const struct sk_buff *skb, u32 offset, void *to, u32 len, u32 start_header)
+ * 	Description
+ * 		This helper is similar to **bpf_skb_load_bytes**\ () in that
+ * 		it provides an easy way to load *len* bytes from *offset*
+ * 		from the packet associated to *skb*, into the buffer pointed
+ * 		by *to*. The difference to **bpf_skb_load_bytes**\ () is that
+ * 		a fifth argument *start_header* exists in order to select a
+ * 		base offset to start from. *start_header* can be one of:
+ *
+ * 		**BPF_HDR_START_MAC**
+ * 			Base offset to load data from is *skb*'s mac header.
+ * 		**BPF_HDR_START_NET**
+ * 			Base offset to load data from is *skb*'s network header.
+ *
+ * 		In general, "direct packet access" is the preferred method to
+ * 		access packet data, however, this helper is in particular useful
+ * 		in socket filters where *skb*\ **->data** does not always point
+ * 		to the start of the mac header and where "direct packet access"
+ * 		is not available.
+ * 	Return
+ * 		0 on success, or a negative error in case of failure.
+ *
+ * int bpf_fib_lookup(void *ctx, struct bpf_fib_lookup *params, int plen, u32 flags)
+ *	Description
+ *		Do FIB lookup in kernel tables using parameters in *params*.
+ *		If lookup is successful and result shows packet is to be
+ *		forwarded, the neighbor tables are searched for the nexthop.
+ *		If successful (ie., FIB lookup shows forwarding and nexthop
+ *		is resolved), the nexthop address is returned in ipv4_dst
+ *		or ipv6_dst based on family, smac is set to mac address of
+ *		egress device, dmac is set to nexthop mac address, rt_metric
+ *		is set to metric from route (IPv4/IPv6 only).
+ *
+ *             *plen* argument is the size of the passed in struct.
+ *             *flags* argument can be a combination of one or more of the
+ *             following values:
+ *
+ *		**BPF_FIB_LOOKUP_DIRECT**
+ *			Do a direct table lookup vs full lookup using FIB
+ *			rules.
+ *		**BPF_FIB_LOOKUP_OUTPUT**
+ *			Perform lookup from an egress perspective (default is
+ *			ingress).
+ *
+ *             *ctx* is either **struct xdp_md** for XDP programs or
+ *             **struct sk_buff** tc cls_act programs.
+ *     Return
+ *             Egress device index on success, 0 if packet needs to continue
+ *             up the stack for further processing or a negative error in case
+ *             of failure.
+ *
+ * int bpf_sock_hash_update(struct bpf_sock_ops_kern *skops, struct bpf_map *map, void *key, u64 flags)
+ *	Description
+ *		Add an entry to, or update a sockhash *map* referencing sockets.
+ *		The *skops* is used as a new value for the entry associated to
+ *		*key*. *flags* is one of:
+ *
+ *		**BPF_NOEXIST**
+ *			The entry for *key* must not exist in the map.
+ *		**BPF_EXIST**
+ *			The entry for *key* must already exist in the map.
+ *		**BPF_ANY**
+ *			No condition on the existence of the entry for *key*.
+ *
+ *		If the *map* has eBPF programs (parser and verdict), those will
+ *		be inherited by the socket being added. If the socket is
+ *		already attached to eBPF programs, this results in an error.
+ *	Return
+ *		0 on success, or a negative error in case of failure.
+ *
+ * int bpf_msg_redirect_hash(struct sk_msg_buff *msg, struct bpf_map *map, void *key, u64 flags)
+ *	Description
+ *		This helper is used in programs implementing policies at the
+ *		socket level. If the message *msg* is allowed to pass (i.e. if
+ *		the verdict eBPF program returns **SK_PASS**), redirect it to
+ *		the socket referenced by *map* (of type
+ *		**BPF_MAP_TYPE_SOCKHASH**) using hash *key*. Both ingress and
+ *		egress interfaces can be used for redirection. The
+ *		**BPF_F_INGRESS** value in *flags* is used to make the
+ *		distinction (ingress path is selected if the flag is present,
+ *		egress path otherwise). This is the only flag supported for now.
+ *	Return
+ *		**SK_PASS** on success, or **SK_DROP** on error.
+ *
+ * int bpf_sk_redirect_hash(struct sk_buff *skb, struct bpf_map *map, void *key, u64 flags)
+ *	Description
+ *		This helper is used in programs implementing policies at the
+ *		skb socket level. If the sk_buff *skb* is allowed to pass (i.e.
+ *		if the verdeict eBPF program returns **SK_PASS**), redirect it
+ *		to the socket referenced by *map* (of type
+ *		**BPF_MAP_TYPE_SOCKHASH**) using hash *key*. Both ingress and
+ *		egress interfaces can be used for redirection. The
+ *		**BPF_F_INGRESS** value in *flags* is used to make the
+ *		distinction (ingress path is selected if the flag is present,
+ *		egress otherwise). This is the only flag supported for now.
+ *	Return
+ *		**SK_PASS** on success, or **SK_DROP** on error.
+ *
+ * int bpf_lwt_push_encap(struct sk_buff *skb, u32 type, void *hdr, u32 len)
+ *	Description
+ *		Encapsulate the packet associated to *skb* within a Layer 3
+ *		protocol header. This header is provided in the buffer at
+ *		address *hdr*, with *len* its size in bytes. *type* indicates
+ *		the protocol of the header and can be one of:
+ *
+ *		**BPF_LWT_ENCAP_SEG6**
+ *			IPv6 encapsulation with Segment Routing Header
+ *			(**struct ipv6_sr_hdr**). *hdr* only contains the SRH,
+ *			the IPv6 header is computed by the kernel.
+ *		**BPF_LWT_ENCAP_SEG6_INLINE**
+ *			Only works if *skb* contains an IPv6 packet. Insert a
+ *			Segment Routing Header (**struct ipv6_sr_hdr**) inside
+ *			the IPv6 header.
+ *
+ * 		A call to this helper is susceptible to change the underlaying
+ * 		packet buffer. Therefore, at load time, all checks on pointers
+ * 		previously done by the verifier are invalidated and must be
+ * 		performed again, if the helper is used in combination with
+ * 		direct packet access.
+ *	Return
+ * 		0 on success, or a negative error in case of failure.
+ *
+ * int bpf_lwt_seg6_store_bytes(struct sk_buff *skb, u32 offset, const void *from, u32 len)
+ *	Description
+ *		Store *len* bytes from address *from* into the packet
+ *		associated to *skb*, at *offset*. Only the flags, tag and TLVs
+ *		inside the outermost IPv6 Segment Routing Header can be
+ *		modified through this helper.
+ *
+ * 		A call to this helper is susceptible to change the underlaying
+ * 		packet buffer. Therefore, at load time, all checks on pointers
+ * 		previously done by the verifier are invalidated and must be
+ * 		performed again, if the helper is used in combination with
+ * 		direct packet access.
+ *	Return
+ * 		0 on success, or a negative error in case of failure.
+ *
+ * int bpf_lwt_seg6_adjust_srh(struct sk_buff *skb, u32 offset, s32 delta)
+ *	Description
+ *		Adjust the size allocated to TLVs in the outermost IPv6
+ *		Segment Routing Header contained in the packet associated to
+ *		*skb*, at position *offset* by *delta* bytes. Only offsets
+ *		after the segments are accepted. *delta* can be as well
+ *		positive (growing) as negative (shrinking).
+ *
+ * 		A call to this helper is susceptible to change the underlaying
+ * 		packet buffer. Therefore, at load time, all checks on pointers
+ * 		previously done by the verifier are invalidated and must be
+ * 		performed again, if the helper is used in combination with
+ * 		direct packet access.
+ *	Return
+ * 		0 on success, or a negative error in case of failure.
+ *
+ * int bpf_lwt_seg6_action(struct sk_buff *skb, u32 action, void *param, u32 param_len)
+ *	Description
+ *		Apply an IPv6 Segment Routing action of type *action* to the
+ *		packet associated to *skb*. Each action takes a parameter
+ *		contained at address *param*, and of length *param_len* bytes.
+ *		*action* can be one of:
+ *
+ *		**SEG6_LOCAL_ACTION_END_X**
+ *			End.X action: Endpoint with Layer-3 cross-connect.
+ *			Type of *param*: **struct in6_addr**.
+ *		**SEG6_LOCAL_ACTION_END_T**
+ *			End.T action: Endpoint with specific IPv6 table lookup.
+ *			Type of *param*: **int**.
+ *		**SEG6_LOCAL_ACTION_END_B6**
+ *			End.B6 action: Endpoint bound to an SRv6 policy.
+ *			Type of param: **struct ipv6_sr_hdr**.
+ *		**SEG6_LOCAL_ACTION_END_B6_ENCAP**
+ *			End.B6.Encap action: Endpoint bound to an SRv6
+ *			encapsulation policy.
+ *			Type of param: **struct ipv6_sr_hdr**.
+ *
+ * 		A call to this helper is susceptible to change the underlaying
+ * 		packet buffer. Therefore, at load time, all checks on pointers
+ * 		previously done by the verifier are invalidated and must be
+ * 		performed again, if the helper is used in combination with
+ * 		direct packet access.
+ *	Return
+ * 		0 on success, or a negative error in case of failure.
+ *
+ * int bpf_rc_keydown(void *ctx, u32 protocol, u64 scancode, u32 toggle)
+ *	Description
+ *		This helper is used in programs implementing IR decoding, to
+ *		report a successfully decoded key press with *scancode*,
+ *		*toggle* value in the given *protocol*. The scancode will be
+ *		translated to a keycode using the rc keymap, and reported as
+ *		an input key down event. After a period a key up event is
+ *		generated. This period can be extended by calling either
+ *		**bpf_rc_keydown** () again with the same values, or calling
+ *		**bpf_rc_repeat** ().
+ *
+ *		Some protocols include a toggle bit, in case the button	was
+ *		released and pressed again between consecutive scancodes.
+ *
+ *		The *ctx* should point to the lirc sample as passed into
+ *		the program.
+ *
+ *		The *protocol* is the decoded protocol number (see
+ *		**enum rc_proto** for some predefined values).
+ *
+ *		This helper is only available is the kernel was compiled with
+ *		the **CONFIG_BPF_LIRC_MODE2** configuration option set to
+ *		"**y**".
+ *
+ *	Return
+ *		0
+ *
+ * int bpf_rc_repeat(void *ctx)
+ *	Description
+ *		This helper is used in programs implementing IR decoding, to
+ *		report a successfully decoded repeat key message. This delays
+ *		the generation of a key up event for previously generated
+ *		key down event.
+ *
+ *		Some IR protocols like NEC have a special IR message for
+ *		repeating last button, for when a button is held down.
+ *
+ *		The *ctx* should point to the lirc sample as passed into
+ *		the program.
+ *
+ *		This helper is only available is the kernel was compiled with
+ *		the **CONFIG_BPF_LIRC_MODE2** configuration option set to
+ *		"**y**".
+ *
+ *	Return
+ *		0
  */
 #define __BPF_FUNC_MAPPER(FN)		\
 	FN(unspec),			\
@@ -743,7 +1368,21 @@ union bpf_attr {
 	FN(msg_apply_bytes),		\
 	FN(msg_cork_bytes),		\
 	FN(msg_pull_data),		\
-	FN(bind),
+	FN(bind),			\
+	FN(xdp_adjust_tail),		\
+	FN(skb_get_xfrm_state),		\
+	FN(get_stack),			\
+	FN(skb_load_bytes_relative),	\
+	FN(fib_lookup),			\
+	FN(sock_hash_update),		\
+	FN(msg_redirect_hash),		\
+	FN(sk_redirect_hash),		\
+	FN(lwt_push_encap),		\
+	FN(lwt_seg6_store_bytes),	\
+	FN(lwt_seg6_adjust_srh),	\
+	FN(lwt_seg6_action),		\
+	FN(rc_repeat),			\
+	FN(rc_keydown),
 
 /* integer value in 'imm' field of BPF_CALL instruction selects which helper
  * function eBPF program intends to call

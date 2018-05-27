@@ -23,6 +23,11 @@
 
 #include <linux/module.h>
 #include <linux/kernel.h>
+#include <linux/mutex.h>
+#include <linux/device.h>
+#include <linux/file.h>
+#include <linux/idr.h>
+#include <linux/poll.h>
 #include <linux/sched.h>
 #include <linux/errno.h>
 #include <linux/ioctl.h>
@@ -76,8 +81,78 @@ static struct class *lirc_class;
  */
 static void lirc_irctl_init(struct irctl *ir)
 {
-	mutex_init(&ir->irctl_lock);
-	ir->d.minor = NOPLUG;
+	unsigned long flags;
+	struct lirc_fh *fh;
+	int sample;
+
+	/* Packet start */
+	if (ev.reset) {
+		/*
+		 * Userspace expects a long space event before the start of
+		 * the signal to use as a sync.  This may be done with repeat
+		 * packets and normal samples.  But if a reset has been sent
+		 * then we assume that a long time has passed, so we send a
+		 * space with the maximum time value.
+		 */
+		sample = LIRC_SPACE(LIRC_VALUE_MASK);
+		dev_dbg(&dev->dev, "delivering reset sync space to lirc_dev\n");
+
+	/* Carrier reports */
+	} else if (ev.carrier_report) {
+		sample = LIRC_FREQUENCY(ev.carrier);
+		dev_dbg(&dev->dev, "carrier report (freq: %d)\n", sample);
+
+	/* Packet end */
+	} else if (ev.timeout) {
+		if (dev->gap)
+			return;
+
+		dev->gap_start = ktime_get();
+		dev->gap = true;
+		dev->gap_duration = ev.duration;
+
+		sample = LIRC_TIMEOUT(ev.duration / 1000);
+		dev_dbg(&dev->dev, "timeout report (duration: %d)\n", sample);
+
+	/* Normal sample */
+	} else {
+		if (dev->gap) {
+			dev->gap_duration += ktime_to_ns(ktime_sub(ktime_get(),
+							 dev->gap_start));
+
+			/* Convert to ms and cap by LIRC_VALUE_MASK */
+			do_div(dev->gap_duration, 1000);
+			dev->gap_duration = min_t(u64, dev->gap_duration,
+						  LIRC_VALUE_MASK);
+
+			spin_lock_irqsave(&dev->lirc_fh_lock, flags);
+			list_for_each_entry(fh, &dev->lirc_fh, list)
+				kfifo_put(&fh->rawir,
+					  LIRC_SPACE(dev->gap_duration));
+			spin_unlock_irqrestore(&dev->lirc_fh_lock, flags);
+			dev->gap = false;
+		}
+
+		sample = ev.pulse ? LIRC_PULSE(ev.duration / 1000) :
+					LIRC_SPACE(ev.duration / 1000);
+		dev_dbg(&dev->dev, "delivering %uus %s to lirc_dev\n",
+			TO_US(ev.duration), TO_STR(ev.pulse));
+	}
+
+	/*
+	 * bpf does not care about the gap generated above; that exists
+	 * for backwards compatibility
+	 */
+	lirc_bpf_run(dev, sample);
+
+	spin_lock_irqsave(&dev->lirc_fh_lock, flags);
+	list_for_each_entry(fh, &dev->lirc_fh, list) {
+		if (LIRC_IS_TIMEOUT(sample) && !fh->send_timeout_reports)
+			continue;
+		if (kfifo_put(&fh->rawir, sample))
+			wake_up_poll(&fh->wait_poll, EPOLLIN | EPOLLRDNORM);
+	}
+	spin_unlock_irqrestore(&dev->lirc_fh_lock, flags);
 }
 
 static void lirc_irctl_cleanup(struct irctl *ir)
@@ -815,3 +890,27 @@ MODULE_LICENSE("GPL");
 
 module_param(debug, bool, S_IRUGO | S_IWUSR);
 MODULE_PARM_DESC(debug, "Enable debugging messages");
+struct rc_dev *rc_dev_get_from_fd(int fd)
+{
+	struct fd f = fdget(fd);
+	struct lirc_fh *fh;
+	struct rc_dev *dev;
+
+	if (!f.file)
+		return ERR_PTR(-EBADF);
+
+	if (f.file->f_op != &lirc_fops) {
+		fdput(f);
+		return ERR_PTR(-EINVAL);
+	}
+
+	fh = f.file->private_data;
+	dev = fh->rc;
+
+	get_device(&dev->dev);
+	fdput(f);
+
+	return dev;
+}
+
+MODULE_ALIAS("lirc_dev");

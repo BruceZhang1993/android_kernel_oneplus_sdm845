@@ -31,6 +31,49 @@ const char inet_csk_timer_bug_msg[] = "inet_csk BUG: unknown timer value\n";
 EXPORT_SYMBOL(inet_csk_timer_bug_msg);
 #endif
 
+/* match_wildcard == true:  0.0.0.0 equals to any IPv4 addresses
+ * match_wildcard == false: addresses must be exactly the same, i.e.
+ *                          0.0.0.0 only equals to 0.0.0.0
+ */
+static bool ipv4_rcv_saddr_equal(__be32 sk1_rcv_saddr, __be32 sk2_rcv_saddr,
+				 bool sk2_ipv6only, bool match_wildcard)
+{
+	if (!sk2_ipv6only) {
+		if (sk1_rcv_saddr == sk2_rcv_saddr)
+			return true;
+		if (!sk1_rcv_saddr || !sk2_rcv_saddr)
+			return match_wildcard;
+	}
+	return false;
+}
+
+bool inet_rcv_saddr_equal(const struct sock *sk, const struct sock *sk2,
+			  bool match_wildcard)
+{
+#if IS_ENABLED(CONFIG_IPV6)
+	if (sk->sk_family == AF_INET6)
+		return ipv6_rcv_saddr_equal(&sk->sk_v6_rcv_saddr,
+					    inet6_rcv_saddr(sk2),
+					    sk->sk_rcv_saddr,
+					    sk2->sk_rcv_saddr,
+					    ipv6_only_sock(sk),
+					    ipv6_only_sock(sk2),
+					    match_wildcard);
+#endif
+	return ipv4_rcv_saddr_equal(sk->sk_rcv_saddr, sk2->sk_rcv_saddr,
+				    ipv6_only_sock(sk2), match_wildcard);
+}
+EXPORT_SYMBOL(inet_rcv_saddr_equal);
+
+bool inet_rcv_saddr_any(const struct sock *sk)
+{
+#if IS_ENABLED(CONFIG_IPV6)
+	if (sk->sk_family == AF_INET6)
+		return ipv6_addr_any(&sk->sk_v6_rcv_saddr);
+#endif
+	return !sk->sk_rcv_saddr;
+}
+
 void inet_get_local_port_range(struct net *net, int *low, int *high)
 {
 	unsigned int seq;

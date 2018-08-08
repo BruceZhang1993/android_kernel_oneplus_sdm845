@@ -127,6 +127,7 @@ enum bpf_prog_type {
 	BPF_PROG_TYPE_CGROUP_SOCK_ADDR,
 	BPF_PROG_TYPE_LWT_SEG6LOCAL,
 	BPF_PROG_TYPE_LIRC_MODE2,
+	BPF_PROG_TYPE_SK_REUSEPORT,
 };
 
 enum bpf_attach_type {
@@ -1302,6 +1303,53 @@ union bpf_attr {
  *
  *	Return
  *		0
+ *
+ * uint64_t bpf_skb_cgroup_id(struct sk_buff *skb)
+ * 	Description
+ * 		Return the cgroup v2 id of the socket associated with the *skb*.
+ * 		This is roughly similar to the **bpf_get_cgroup_classid**\ ()
+ * 		helper for cgroup v1 by providing a tag resp. identifier that
+ * 		can be matched on or used for map lookups e.g. to implement
+ * 		policy. The cgroup v2 id of a given path in the hierarchy is
+ * 		exposed in user space through the f_handle API in order to get
+ * 		to the same 64-bit id.
+ *
+ * 		This helper can be used on TC egress path, but not on ingress,
+ * 		and is available only if the kernel was compiled with the
+ * 		**CONFIG_SOCK_CGROUP_DATA** configuration option.
+ * 	Return
+ * 		The id is returned or 0 in case the id could not be retrieved.
+ *
+ * u64 bpf_get_current_cgroup_id(void)
+ * 	Return
+ * 		A 64-bit integer containing the current cgroup id based
+ * 		on the cgroup within which the current task is running.
+ *
+ * void* get_local_storage(void *map, u64 flags)
+ *	Description
+ *		Get the pointer to the local storage area.
+ *		The type and the size of the local storage is defined
+ *		by the *map* argument.
+ *		The *flags* meaning is specific for each map type,
+ *		and has to be 0 for cgroup local storage.
+ *
+ *		Depending on the bpf program type, a local storage area
+ *		can be shared between multiple instances of the bpf program,
+ *		running simultaneously.
+ *
+ *		A user should care about the synchronization by himself.
+ *		For example, by using the BPF_STX_XADD instruction to alter
+ *		the shared data.
+ *	Return
+ *		Pointer to the local storage area.
+ *
+ * int bpf_sk_select_reuseport(struct sk_reuseport_md *reuse, struct bpf_map *map, void *key, u64 flags)
+ *	Description
+ *		Select a SO_REUSEPORT sk from a	BPF_MAP_TYPE_REUSEPORT_ARRAY map
+ *		It checks the selected sk is matching the incoming
+ *		request in the skb.
+ *	Return
+ *		0 on success, or a negative error in case of failure.
  */
 #define __BPF_FUNC_MAPPER(FN)		\
 	FN(unspec),			\
@@ -1382,7 +1430,11 @@ union bpf_attr {
 	FN(lwt_seg6_adjust_srh),	\
 	FN(lwt_seg6_action),		\
 	FN(rc_repeat),			\
-	FN(rc_keydown),
+	FN(rc_keydown),			\
+	FN(skb_cgroup_id),		\
+	FN(get_current_cgroup_id),	\
+	FN(get_local_storage),		\
+	FN(sk_select_reuseport),
 
 /* integer value in 'imm' field of BPF_CALL instruction selects which helper
  * function eBPF program intends to call
@@ -1865,6 +1917,30 @@ struct xdp_md {
 struct sk_msg_md {
 	void *data;
 	void *data_end;
+};
+
+struct sk_reuseport_md {
+	/*
+	 * Start of directly accessible data. It begins from
+	 * the tcp/udp header.
+	 */
+	void *data;
+	void *data_end;		/* End of directly accessible data */
+	/*
+	 * Total length of packet (starting from the tcp/udp header).
+	 * Note that the directly accessible bytes (data_end - data)
+	 * could be less than this "len".  Those bytes could be
+	 * indirectly read by a helper "bpf_skb_load_bytes()".
+	 */
+	__u32 len;
+	/*
+	 * Eth protocol in the mac header (network byte order). e.g.
+	 * ETH_P_IP(0x0800) and ETH_P_IPV6(0x86DD)
+	 */
+	__u32 eth_protocol;
+	__u32 ip_protocol;	/* IP protocol. e.g. IPPROTO_TCP, IPPROTO_UDP */
+	__u32 bind_inany;	/* Is sock bound to an INANY address? */
+	__u32 hash;		/* A hash of the packet 4 tuples */
 };
 
 #define BPF_TAG_SIZE	8

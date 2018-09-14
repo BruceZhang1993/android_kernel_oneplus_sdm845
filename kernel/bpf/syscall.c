@@ -1227,11 +1227,41 @@ static int bpf_prog_attach(const union bpf_attr *attr)
 	case BPF_SK_SKB_STREAM_VERDICT:
 		return sockmap_get_from_fd(attr, BPF_PROG_TYPE_SK_SKB, true);
 	case BPF_LIRC_MODE2:
-		return lirc_prog_attach(attr);
+		ptype = BPF_PROG_TYPE_LIRC_MODE2;
+		break;
+	case BPF_FLOW_DISSECTOR:
+		ptype = BPF_PROG_TYPE_FLOW_DISSECTOR;
+		break;
 	default:
 		return -EINVAL;
 	}
 
+	prog = bpf_prog_get_type(attr->attach_bpf_fd, ptype);
+	if (IS_ERR(prog))
+		return PTR_ERR(prog);
+
+	if (bpf_prog_attach_check_attach_type(prog, attr->attach_type)) {
+		bpf_prog_put(prog);
+		return -EINVAL;
+	}
+
+	switch (ptype) {
+	case BPF_PROG_TYPE_SK_SKB:
+	case BPF_PROG_TYPE_SK_MSG:
+		ret = sockmap_get_from_fd(attr, ptype, prog);
+		break;
+	case BPF_PROG_TYPE_LIRC_MODE2:
+		ret = lirc_prog_attach(attr, prog);
+		break;
+	case BPF_PROG_TYPE_FLOW_DISSECTOR:
+		ret = skb_flow_dissector_bpf_prog_attach(attr, prog);
+		break;
+	default:
+		ret = cgroup_bpf_prog_attach(attr, ptype, prog);
+	}
+
+	if (ret)
+		bpf_prog_put(prog);
 	return ret;
 }
 
@@ -1282,6 +1312,8 @@ static int bpf_prog_detach(const union bpf_attr *attr)
 		return sockmap_get_from_fd(attr, BPF_PROG_TYPE_SK_SKB, false);
 	case BPF_LIRC_MODE2:
 		return lirc_prog_detach(attr);
+	case BPF_FLOW_DISSECTOR:
+		return skb_flow_dissector_bpf_prog_detach(attr);
 	default:
 		return -EINVAL;
 	}

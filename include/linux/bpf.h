@@ -159,6 +159,7 @@ enum bpf_reg_type {
 	 * map element.
 	 */
 	PTR_TO_MAP_VALUE_ADJ,
+	PTR_TO_FLOW_KEYS,	 /* reg points to bpf_flow_keys */
 };
 
 struct bpf_prog;

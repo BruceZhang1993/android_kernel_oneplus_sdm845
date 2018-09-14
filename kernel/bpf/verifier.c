@@ -202,6 +202,7 @@ static const char * const reg_type_str[] = {
 	[CONST_IMM]		= "imm",
 	[PTR_TO_PACKET]		= "pkt",
 	[PTR_TO_PACKET_END]	= "pkt_end",
+	[PTR_TO_FLOW_KEYS]	= "flow_keys",
 };
 
 static void print_verifier_state(struct bpf_verifier_state *state)
@@ -670,6 +671,7 @@ static bool is_spillable_regtype(enum bpf_reg_type type)
 	case PTR_TO_PACKET:
 	case PTR_TO_PACKET_END:
 	case FRAME_PTR:
+	case PTR_TO_FLOW_KEYS:
 	case CONST_PTR_TO_MAP:
 		return true;
 	default:
@@ -811,6 +813,7 @@ static bool may_access_direct_pkt_data(struct bpf_verifier_env *env,
 	case BPF_PROG_TYPE_LWT_XMIT:
 	case BPF_PROG_TYPE_SK_SKB:
 	case BPF_PROG_TYPE_SK_MSG:
+	case BPF_PROG_TYPE_FLOW_DISSECTOR:
 		if (meta)
 			return meta->pkt_access;
 
@@ -856,6 +859,18 @@ static int check_ctx_access(struct bpf_verifier_env *env, int off, int size,
 	return -EACCES;
 }
 
+static int check_flow_keys_access(struct bpf_verifier_env *env, int off,
+				  int size)
+{
+	if (size < 0 || off < 0 ||
+	    (u64)off + size > sizeof(struct bpf_flow_keys)) {
+		verbose(env, "invalid access to flow keys off=%d size=%d\n",
+			off, size);
+		return -EACCES;
+	}
+	return 0;
+}
+
 static bool __is_pointer_value(bool allow_ptr_leaks,
 			       const struct bpf_reg_state *reg)
 {
@@ -886,14 +901,35 @@ static bool is_ctx_reg(struct bpf_verifier_env *env, int regno)
 static int check_ptr_alignment(struct bpf_verifier_env *env,
 			       struct bpf_reg_state *reg, int off, int size)
 {
-	if (reg->type != PTR_TO_PACKET && reg->type != PTR_TO_MAP_VALUE_ADJ) {
-		if (off % size != 0) {
-			verbose("misaligned access off %d size %d\n",
-				off, size);
-			return -EACCES;
-		} else {
-			return 0;
-		}
+	bool strict = env->strict_alignment || strict_alignment_once;
+	const char *pointer_desc = "";
+
+	switch (reg->type) {
+	case PTR_TO_PACKET:
+	case PTR_TO_PACKET_META:
+		/* Special case, because of NET_IP_ALIGN. Given metadata sits
+		 * right in front, treat it the very same way.
+		 */
+		return check_pkt_ptr_alignment(env, reg, off, size, strict);
+	case PTR_TO_FLOW_KEYS:
+		pointer_desc = "flow keys ";
+		break;
+	case PTR_TO_MAP_VALUE:
+		pointer_desc = "value ";
+		break;
+	case PTR_TO_CTX:
+		pointer_desc = "context ";
+		break;
+	case PTR_TO_STACK:
+		pointer_desc = "stack ";
+		/* The stack spill tracking logic in check_stack_write()
+		 * and check_stack_read() relies on stack accesses being
+		 * aligned.
+		 */
+		strict = true;
+		break;
+	default:
+		break;
 	}
 
 	if (IS_ENABLED(CONFIG_HAVE_EFFICIENT_UNALIGNED_ACCESS))
@@ -1034,7 +1070,18 @@ static int check_mem_access(struct bpf_verifier_env *env, int insn_idx, u32 regn
 		}
 		err = check_packet_access(env, regno, off, size);
 		if (!err && t == BPF_READ && value_regno >= 0)
-			mark_reg_unknown_value(state->regs, value_regno);
+			mark_reg_unknown(env, regs, value_regno);
+	} else if (reg->type == PTR_TO_FLOW_KEYS) {
+		if (t == BPF_WRITE && value_regno >= 0 &&
+		    is_pointer_value(env, value_regno)) {
+			verbose(env, "R%d leaks addr into flow keys\n",
+				value_regno);
+			return -EACCES;
+		}
+
+		err = check_flow_keys_access(env, off, size);
+		if (!err && t == BPF_READ && value_regno >= 0)
+			mark_reg_unknown(env, regs, value_regno);
 	} else {
 		verbose("R%d invalid mem access '%s'\n",
 			regno, reg_type_str[reg->type]);
@@ -1140,7 +1187,42 @@ static int check_stack_boundary(struct bpf_verifier_env *env, int regno,
 			return -EACCES;
 		}
 	}
-	return 0;
+	return update_stack_depth(env, state, off);
+}
+
+static int check_helper_mem_access(struct bpf_verifier_env *env, int regno,
+				   int access_size, bool zero_size_allowed,
+				   struct bpf_call_arg_meta *meta)
+{
+	struct bpf_reg_state *regs = cur_regs(env), *reg = &regs[regno];
+
+	switch (reg->type) {
+	case PTR_TO_PACKET:
+	case PTR_TO_PACKET_META:
+		return check_packet_access(env, regno, reg->off, access_size,
+					   zero_size_allowed);
+	case PTR_TO_FLOW_KEYS:
+		return check_flow_keys_access(env, reg->off, access_size);
+	case PTR_TO_MAP_VALUE:
+		return check_map_access(env, regno, reg->off, access_size,
+					zero_size_allowed);
+	default: /* scalar_value|ptr_to_stack or invalid ptr */
+		return check_stack_boundary(env, regno, access_size,
+					    zero_size_allowed, meta);
+	}
+}
+
+static bool arg_type_is_mem_ptr(enum bpf_arg_type type)
+{
+	return type == ARG_PTR_TO_MEM ||
+	       type == ARG_PTR_TO_MEM_OR_NULL ||
+	       type == ARG_PTR_TO_UNINIT_MEM;
+}
+
+static bool arg_type_is_mem_size(enum bpf_arg_type type)
+{
+	return type == ARG_CONST_SIZE ||
+	       type == ARG_CONST_SIZE_OR_ZERO;
 }
 
 static int check_func_arg(struct bpf_verifier_env *env, u32 regno,
@@ -2928,6 +3010,79 @@ static bool compare_ptrs_to_packet(struct bpf_reg_state *old,
 {
 	if (old->id != cur->id)
 		return false;
+	switch (rold->type) {
+	case SCALAR_VALUE:
+		if (rcur->type == SCALAR_VALUE) {
+			/* new val must satisfy old val knowledge */
+			return range_within(rold, rcur) &&
+			       tnum_in(rold->var_off, rcur->var_off);
+		} else {
+			/* We're trying to use a pointer in place of a scalar.
+			 * Even if the scalar was unbounded, this could lead to
+			 * pointer leaks because scalars are allowed to leak
+			 * while pointers are not. We could make this safe in
+			 * special cases if root is calling us, but it's
+			 * probably not worth the hassle.
+			 */
+			return false;
+		}
+	case PTR_TO_MAP_VALUE:
+		/* If the new min/max/var_off satisfy the old ones and
+		 * everything else matches, we are OK.
+		 * We don't care about the 'id' value, because nothing
+		 * uses it for PTR_TO_MAP_VALUE (only for ..._OR_NULL)
+		 */
+		return memcmp(rold, rcur, offsetof(struct bpf_reg_state, id)) == 0 &&
+		       range_within(rold, rcur) &&
+		       tnum_in(rold->var_off, rcur->var_off);
+	case PTR_TO_MAP_VALUE_OR_NULL:
+		/* a PTR_TO_MAP_VALUE could be safe to use as a
+		 * PTR_TO_MAP_VALUE_OR_NULL into the same map.
+		 * However, if the old PTR_TO_MAP_VALUE_OR_NULL then got NULL-
+		 * checked, doing so could have affected others with the same
+		 * id, and we can't check for that because we lost the id when
+		 * we converted to a PTR_TO_MAP_VALUE.
+		 */
+		if (rcur->type != PTR_TO_MAP_VALUE_OR_NULL)
+			return false;
+		if (memcmp(rold, rcur, offsetof(struct bpf_reg_state, id)))
+			return false;
+		/* Check our ids match any regs they're supposed to */
+		return check_ids(rold->id, rcur->id, idmap);
+	case PTR_TO_PACKET_META:
+	case PTR_TO_PACKET:
+		if (rcur->type != rold->type)
+			return false;
+		/* We must have at least as much range as the old ptr
+		 * did, so that any accesses which were safe before are
+		 * still safe.  This is true even if old range < old off,
+		 * since someone could have accessed through (ptr - k), or
+		 * even done ptr -= k in a register, to get a safe access.
+		 */
+		if (rold->range > rcur->range)
+			return false;
+		/* If the offsets don't match, we can't trust our alignment;
+		 * nor can we be sure that we won't fall out of range.
+		 */
+		if (rold->off != rcur->off)
+			return false;
+		/* id relations must be preserved */
+		if (rold->id && !check_ids(rold->id, rcur->id, idmap))
+			return false;
+		/* new val must satisfy old val knowledge */
+		return range_within(rold, rcur) &&
+		       tnum_in(rold->var_off, rcur->var_off);
+	case PTR_TO_CTX:
+	case CONST_PTR_TO_MAP:
+	case PTR_TO_PACKET_END:
+	case PTR_TO_FLOW_KEYS:
+		/* Only valid matches are exact, which memcmp() above
+		 * would have accepted
+		 */
+	default:
+		/* Don't know what's going on, just say it's not safe */
+		return false;
+	}
 
 	/* old ptr_to_packet is more conservative, since it allows smaller
 	 * range. Ex:

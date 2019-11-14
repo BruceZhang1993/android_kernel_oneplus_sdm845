@@ -12,6 +12,12 @@
 #include <linux/file.h>
 #include <linux/percpu.h>
 #include <linux/err.h>
+#include <linux/rbtree_latch.h>
+#include <linux/numa.h>
+#include <linux/wait.h>
+#include <linux/u64_stats_sync.h>
+#include <linux/refcount.h>
+#include <linux/mutex.h>
 
 struct perf_event;
 struct bpf_map;
@@ -196,6 +202,131 @@ struct bpf_prog_type_list {
 	enum bpf_prog_type type;
 };
 
+struct bpf_prog_offload {
+	struct bpf_prog		*prog;
+	struct net_device	*netdev;
+	struct bpf_offload_dev	*offdev;
+	void			*dev_priv;
+	struct list_head	offloads;
+	bool			dev_state;
+	bool			opt_failed;
+	void			*jited_image;
+	u32			jited_len;
+};
+
+enum bpf_cgroup_storage_type {
+	BPF_CGROUP_STORAGE_SHARED,
+	BPF_CGROUP_STORAGE_PERCPU,
+	__BPF_CGROUP_STORAGE_MAX
+};
+
+#define MAX_BPF_CGROUP_STORAGE_TYPE __BPF_CGROUP_STORAGE_MAX
+
+/* The longest tracepoint has 12 args.
+ * See include/trace/bpf_probe.h
+ */
+#define MAX_BPF_FUNC_ARGS 12
+
+struct bpf_prog_stats {
+	u64 cnt;
+	u64 nsecs;
+	struct u64_stats_sync syncp;
+} __aligned(2 * sizeof(u64));
+
+struct btf_func_model {
+	u8 ret_size;
+	u8 nr_args;
+	u8 arg_size[MAX_BPF_FUNC_ARGS];
+};
+
+/* Restore arguments before returning from trampoline to let original function
+ * continue executing. This flag is used for fentry progs when there are no
+ * fexit progs.
+ */
+#define BPF_TRAMP_F_RESTORE_REGS	BIT(0)
+/* Call original function after fentry progs, but before fexit progs.
+ * Makes sense for fentry/fexit, normal calls and indirect calls.
+ */
+#define BPF_TRAMP_F_CALL_ORIG		BIT(1)
+/* Skip current frame and return to parent.  Makes sense for fentry/fexit
+ * programs only. Should not be used with normal calls and indirect calls.
+ */
+#define BPF_TRAMP_F_SKIP_FRAME		BIT(2)
+
+/* Different use cases for BPF trampoline:
+ * 1. replace nop at the function entry (kprobe equivalent)
+ *    flags = BPF_TRAMP_F_RESTORE_REGS
+ *    fentry = a set of programs to run before returning from trampoline
+ *
+ * 2. replace nop at the function entry (kprobe + kretprobe equivalent)
+ *    flags = BPF_TRAMP_F_CALL_ORIG | BPF_TRAMP_F_SKIP_FRAME
+ *    orig_call = fentry_ip + MCOUNT_INSN_SIZE
+ *    fentry = a set of program to run before calling original function
+ *    fexit = a set of program to run after original function
+ *
+ * 3. replace direct call instruction anywhere in the function body
+ *    or assign a function pointer for indirect call (like tcp_congestion_ops->cong_avoid)
+ *    With flags = 0
+ *      fentry = a set of programs to run before returning from trampoline
+ *    With flags = BPF_TRAMP_F_CALL_ORIG
+ *      orig_call = original callback addr or direct function addr
+ *      fentry = a set of program to run before calling original function
+ *      fexit = a set of program to run after original function
+ */
+int arch_prepare_bpf_trampoline(void *image, struct btf_func_model *m, u32 flags,
+				struct bpf_prog **fentry_progs, int fentry_cnt,
+				struct bpf_prog **fexit_progs, int fexit_cnt,
+				void *orig_call);
+/* these two functions are called from generated trampoline */
+u64 notrace __bpf_prog_enter(void);
+void notrace __bpf_prog_exit(struct bpf_prog *prog, u64 start);
+
+enum bpf_tramp_prog_type {
+	BPF_TRAMP_FENTRY,
+	BPF_TRAMP_FEXIT,
+	BPF_TRAMP_MAX
+};
+
+struct bpf_trampoline {
+	/* hlist for trampoline_table */
+	struct hlist_node hlist;
+	/* serializes access to fields of this trampoline */
+	struct mutex mutex;
+	refcount_t refcnt;
+	u64 key;
+	struct {
+		struct btf_func_model model;
+		void *addr;
+	} func;
+	/* list of BPF programs using this trampoline */
+	struct hlist_head progs_hlist[BPF_TRAMP_MAX];
+	/* Number of attached programs. A counter per kind. */
+	int progs_cnt[BPF_TRAMP_MAX];
+	/* Executable image of trampoline */
+	void *image;
+	u64 selector;
+};
+#ifdef CONFIG_BPF_JIT
+struct bpf_trampoline *bpf_trampoline_lookup(u64 key);
+int bpf_trampoline_link_prog(struct bpf_prog *prog);
+int bpf_trampoline_unlink_prog(struct bpf_prog *prog);
+void bpf_trampoline_put(struct bpf_trampoline *tr);
+#else
+static inline struct bpf_trampoline *bpf_trampoline_lookup(u64 key)
+{
+	return NULL;
+}
+static inline int bpf_trampoline_link_prog(struct bpf_prog *prog)
+{
+	return -ENOTSUPP;
+}
+static inline int bpf_trampoline_unlink_prog(struct bpf_prog *prog)
+{
+	return -ENOTSUPP;
+}
+static inline void bpf_trampoline_put(struct bpf_trampoline *tr) {}
+#endif
+
 struct bpf_prog_aux {
 	atomic_t refcnt;
 	u32 used_map_cnt;
@@ -204,6 +335,21 @@ struct bpf_prog_aux {
 	u32 max_tp_access;
 	u32 stack_depth;
 	u32 id;
+	u32 func_cnt; /* used by non-func prog as the number of func progs */
+	u32 func_idx; /* 0 for non-func prog, the index in func array for func prog */
+	u32 attach_btf_id; /* in-kernel BTF type id to attach to */
+	bool verifier_zext; /* Zero extensions has been inserted by verifier. */
+	bool offload_requested;
+	bool attach_btf_trace; /* true if attaching to BTF-enabled raw tp */
+	enum bpf_tramp_prog_type trampoline_prog_type;
+	struct bpf_trampoline *trampoline;
+	struct hlist_node tramp_hlist;
+	/* BTF_KIND_FUNC_PROTO for valid attach_btf_id */
+	const struct btf_type *attach_func_proto;
+	/* function name for valid attach_btf_id */
+	const char *attach_func_name;
+	struct bpf_prog **func;
+	void *jit_data; /* JIT specific data. arch dependent */
 	struct latch_tree_node ksym_tnode;
 	struct list_head ksym_lnode;
 	const struct bpf_verifier_ops *ops;
@@ -345,6 +491,13 @@ static inline void bpf_register_prog_type(struct bpf_prog_type_list *tl)
 {
 }
 
+int btf_distill_func_proto(struct bpf_verifier_log *log,
+			   struct btf *btf,
+			   const struct btf_type *func_proto,
+			   const char *func_name,
+			   struct btf_func_model *m);
+
+#else /* !CONFIG_BPF_SYSCALL */
 static inline struct bpf_prog *bpf_prog_get(u32 ufd)
 {
 	return ERR_PTR(-EOPNOTSUPP);

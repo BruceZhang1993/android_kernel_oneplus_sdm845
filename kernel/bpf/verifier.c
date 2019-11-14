@@ -4671,7 +4671,134 @@ static void free_states(struct bpf_verifier_env *env)
 
 int bpf_check(struct bpf_prog **prog, union bpf_attr *attr)
 {
-	char __user *log_ubuf = NULL;
+	int i;
+
+	if (env->log.level & BPF_LOG_STATS) {
+		verbose(env, "verification time %lld usec\n",
+			div_u64(env->verification_time, 1000));
+		verbose(env, "stack depth ");
+		for (i = 0; i < env->subprog_cnt; i++) {
+			u32 depth = env->subprog_info[i].stack_depth;
+
+			verbose(env, "%d", depth);
+			if (i + 1 < env->subprog_cnt)
+				verbose(env, "+");
+		}
+		verbose(env, "\n");
+	}
+	verbose(env, "processed %d insns (limit %d) max_states_per_insn %d "
+		"total_states %d peak_states %d mark_read %d\n",
+		env->insn_processed, BPF_COMPLEXITY_LIMIT_INSNS,
+		env->max_states_per_insn, env->total_states,
+		env->peak_states, env->longest_mark_read_walk);
+}
+
+static int check_attach_btf_id(struct bpf_verifier_env *env)
+{
+	struct bpf_prog *prog = env->prog;
+	u32 btf_id = prog->aux->attach_btf_id;
+	const char prefix[] = "btf_trace_";
+	struct bpf_trampoline *tr;
+	const struct btf_type *t;
+	const char *tname;
+	int ret = 0;
+	long addr;
+
+	if (prog->type != BPF_PROG_TYPE_TRACING)
+		return 0;
+
+	if (!btf_id) {
+		verbose(env, "Tracing programs must provide btf_id\n");
+		return -EINVAL;
+	}
+	t = btf_type_by_id(btf_vmlinux, btf_id);
+	if (!t) {
+		verbose(env, "attach_btf_id %u is invalid\n", btf_id);
+		return -EINVAL;
+	}
+	tname = btf_name_by_offset(btf_vmlinux, t->name_off);
+	if (!tname) {
+		verbose(env, "attach_btf_id %u doesn't have a name\n", btf_id);
+		return -EINVAL;
+	}
+
+	switch (prog->expected_attach_type) {
+	case BPF_TRACE_RAW_TP:
+		if (!btf_type_is_typedef(t)) {
+			verbose(env, "attach_btf_id %u is not a typedef\n",
+				btf_id);
+			return -EINVAL;
+		}
+		if (strncmp(prefix, tname, sizeof(prefix) - 1)) {
+			verbose(env, "attach_btf_id %u points to wrong type name %s\n",
+				btf_id, tname);
+			return -EINVAL;
+		}
+		tname += sizeof(prefix) - 1;
+		t = btf_type_by_id(btf_vmlinux, t->type);
+		if (!btf_type_is_ptr(t))
+			/* should never happen in valid vmlinux build */
+			return -EINVAL;
+		t = btf_type_by_id(btf_vmlinux, t->type);
+		if (!btf_type_is_func_proto(t))
+			/* should never happen in valid vmlinux build */
+			return -EINVAL;
+
+		/* remember two read only pointers that are valid for
+		 * the life time of the kernel
+		 */
+		prog->aux->attach_func_name = tname;
+		prog->aux->attach_func_proto = t;
+		prog->aux->attach_btf_trace = true;
+		return 0;
+	case BPF_TRACE_FENTRY:
+	case BPF_TRACE_FEXIT:
+		if (!btf_type_is_func(t)) {
+			verbose(env, "attach_btf_id %u is not a function\n",
+				btf_id);
+			return -EINVAL;
+		}
+		t = btf_type_by_id(btf_vmlinux, t->type);
+		if (!btf_type_is_func_proto(t))
+			return -EINVAL;
+		tr = bpf_trampoline_lookup(btf_id);
+		if (!tr)
+			return -ENOMEM;
+		prog->aux->attach_func_name = tname;
+		prog->aux->attach_func_proto = t;
+		mutex_lock(&tr->mutex);
+		if (tr->func.addr) {
+			prog->aux->trampoline = tr;
+			goto out;
+		}
+		ret = btf_distill_func_proto(&env->log, btf_vmlinux, t,
+					     tname, &tr->func.model);
+		if (ret < 0)
+			goto out;
+		addr = kallsyms_lookup_name(tname);
+		if (!addr) {
+			verbose(env,
+				"The address of function %s cannot be found\n",
+				tname);
+			ret = -ENOENT;
+			goto out;
+		}
+		tr->func.addr = (void *)addr;
+		prog->aux->trampoline = tr;
+out:
+		mutex_unlock(&tr->mutex);
+		if (ret)
+			bpf_trampoline_put(tr);
+		return ret;
+	default:
+		return -EINVAL;
+	}
+}
+
+int bpf_check(struct bpf_prog **prog, union bpf_attr *attr,
+	      union bpf_attr __user *uattr)
+{
+	u64 start_time = ktime_get_ns();
 	struct bpf_verifier_env *env;
 	int ret = -EINVAL;
 

@@ -101,6 +101,57 @@ const char *bpf_program__title(struct bpf_program *prog, bool needs_copy);
 
 int bpf_program__fd(struct bpf_program *prog);
 
+/* returns program size in bytes */
+LIBBPF_API size_t bpf_program__size(const struct bpf_program *prog);
+
+LIBBPF_API int bpf_program__load(struct bpf_program *prog, char *license,
+				 __u32 kern_version);
+LIBBPF_API int bpf_program__fd(const struct bpf_program *prog);
+LIBBPF_API int bpf_program__pin_instance(struct bpf_program *prog,
+					 const char *path,
+					 int instance);
+LIBBPF_API int bpf_program__unpin_instance(struct bpf_program *prog,
+					   const char *path,
+					   int instance);
+LIBBPF_API int bpf_program__pin(struct bpf_program *prog, const char *path);
+LIBBPF_API int bpf_program__unpin(struct bpf_program *prog, const char *path);
+LIBBPF_API void bpf_program__unload(struct bpf_program *prog);
+
+struct bpf_link;
+
+LIBBPF_API struct bpf_link *bpf_link__open(const char *path);
+LIBBPF_API int bpf_link__fd(const struct bpf_link *link);
+LIBBPF_API const char *bpf_link__pin_path(const struct bpf_link *link);
+LIBBPF_API int bpf_link__pin(struct bpf_link *link, const char *path);
+LIBBPF_API int bpf_link__unpin(struct bpf_link *link);
+LIBBPF_API void bpf_link__disconnect(struct bpf_link *link);
+LIBBPF_API int bpf_link__destroy(struct bpf_link *link);
+
+LIBBPF_API struct bpf_link *
+bpf_program__attach(struct bpf_program *prog);
+LIBBPF_API struct bpf_link *
+bpf_program__attach_perf_event(struct bpf_program *prog, int pfd);
+LIBBPF_API struct bpf_link *
+bpf_program__attach_kprobe(struct bpf_program *prog, bool retprobe,
+			   const char *func_name);
+LIBBPF_API struct bpf_link *
+bpf_program__attach_uprobe(struct bpf_program *prog, bool retprobe,
+			   pid_t pid, const char *binary_path,
+			   size_t func_offset);
+LIBBPF_API struct bpf_link *
+bpf_program__attach_tracepoint(struct bpf_program *prog,
+			       const char *tp_category,
+			       const char *tp_name);
+LIBBPF_API struct bpf_link *
+bpf_program__attach_raw_tracepoint(struct bpf_program *prog,
+				   const char *tp_name);
+
+LIBBPF_API struct bpf_link *
+bpf_program__attach_trace(struct bpf_program *prog);
+LIBBPF_API struct bpf_link *
+bpf_program__attach_lsm(struct bpf_program *prog);
+struct bpf_map;
+LIBBPF_API struct bpf_link *bpf_map__attach_struct_ops(struct bpf_map *map);
 struct bpf_insn;
 
 /*
@@ -168,11 +219,45 @@ int bpf_program__nth_fd(struct bpf_program *prog, int n);
 /*
  * Adjust type of bpf program. Default is kprobe.
  */
-int bpf_program__set_tracepoint(struct bpf_program *prog);
-int bpf_program__set_kprobe(struct bpf_program *prog);
+LIBBPF_API int bpf_program__set_socket_filter(struct bpf_program *prog);
+LIBBPF_API int bpf_program__set_tracepoint(struct bpf_program *prog);
+LIBBPF_API int bpf_program__set_raw_tracepoint(struct bpf_program *prog);
+LIBBPF_API int bpf_program__set_kprobe(struct bpf_program *prog);
+LIBBPF_API int bpf_program__set_lsm(struct bpf_program *prog);
+LIBBPF_API int bpf_program__set_sched_cls(struct bpf_program *prog);
+LIBBPF_API int bpf_program__set_sched_act(struct bpf_program *prog);
+LIBBPF_API int bpf_program__set_xdp(struct bpf_program *prog);
+LIBBPF_API int bpf_program__set_perf_event(struct bpf_program *prog);
+LIBBPF_API int bpf_program__set_tracing(struct bpf_program *prog);
+LIBBPF_API int bpf_program__set_struct_ops(struct bpf_program *prog);
+LIBBPF_API int bpf_program__set_extension(struct bpf_program *prog);
 
-bool bpf_program__is_tracepoint(struct bpf_program *prog);
-bool bpf_program__is_kprobe(struct bpf_program *prog);
+LIBBPF_API enum bpf_prog_type bpf_program__get_type(struct bpf_program *prog);
+LIBBPF_API void bpf_program__set_type(struct bpf_program *prog,
+				      enum bpf_prog_type type);
+
+LIBBPF_API enum bpf_attach_type
+bpf_program__get_expected_attach_type(struct bpf_program *prog);
+LIBBPF_API void
+bpf_program__set_expected_attach_type(struct bpf_program *prog,
+				      enum bpf_attach_type type);
+
+LIBBPF_API int
+bpf_program__set_attach_target(struct bpf_program *prog, int attach_prog_fd,
+			       const char *attach_func_name);
+
+LIBBPF_API bool bpf_program__is_socket_filter(const struct bpf_program *prog);
+LIBBPF_API bool bpf_program__is_tracepoint(const struct bpf_program *prog);
+LIBBPF_API bool bpf_program__is_raw_tracepoint(const struct bpf_program *prog);
+LIBBPF_API bool bpf_program__is_kprobe(const struct bpf_program *prog);
+LIBBPF_API bool bpf_program__is_lsm(const struct bpf_program *prog);
+LIBBPF_API bool bpf_program__is_sched_cls(const struct bpf_program *prog);
+LIBBPF_API bool bpf_program__is_sched_act(const struct bpf_program *prog);
+LIBBPF_API bool bpf_program__is_xdp(const struct bpf_program *prog);
+LIBBPF_API bool bpf_program__is_perf_event(const struct bpf_program *prog);
+LIBBPF_API bool bpf_program__is_tracing(const struct bpf_program *prog);
+LIBBPF_API bool bpf_program__is_struct_ops(const struct bpf_program *prog);
+LIBBPF_API bool bpf_program__is_extension(const struct bpf_program *prog);
 
 /*
  * We don't need __attribute__((packed)) now since it is

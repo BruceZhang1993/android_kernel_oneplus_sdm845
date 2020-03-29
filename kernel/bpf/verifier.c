@@ -22,6 +22,10 @@
 #include <linux/stringify.h>
 #include <linux/bsearch.h>
 #include <linux/sort.h>
+#include <linux/perf_event.h>
+#include <linux/ctype.h>
+#include <linux/error-injection.h>
+#include <linux/bpf_lsm.h>
 
 #include "disasm.h"
 
@@ -3029,6 +3033,28 @@ static int check_return_code(struct bpf_verifier_env *env)
 {
 	struct bpf_reg_state *reg;
 	struct tnum range = tnum_range(0, 1);
+	int err;
+
+	/* LSM and struct_ops func-ptr's return type could be "void" */
+	if ((env->prog->type == BPF_PROG_TYPE_STRUCT_OPS ||
+	     env->prog->type == BPF_PROG_TYPE_LSM) &&
+	    !prog->aux->attach_func_proto->type)
+		return 0;
+
+	/* eBPF calling convetion is such that R0 is used
+	 * to return the value from eBPF program.
+	 * Make sure that it's readable at this time
+	 * of bpf_exit, which means that program wrote
+	 * something into it earlier
+	 */
+	err = check_reg_arg(env, BPF_REG_0, SRC_OP);
+	if (err)
+		return err;
+
+	if (is_pointer_value(env, BPF_REG_0)) {
+		verbose(env, "R0 leaks addr as return value\n");
+		return -EACCES;
+	}
 
 	switch (env->prog->type) {
 	case BPF_PROG_TYPE_CGROUP_SKB:
@@ -4704,7 +4730,12 @@ static int check_attach_btf_id(struct bpf_verifier_env *env)
 	int ret = 0;
 	long addr;
 
-	if (prog->type != BPF_PROG_TYPE_TRACING)
+	if (prog->type == BPF_PROG_TYPE_STRUCT_OPS)
+		return check_struct_ops_btf_id(env);
+
+	if (prog->type != BPF_PROG_TYPE_TRACING &&
+	    prog->type != BPF_PROG_TYPE_LSM &&
+	    !prog_extension)
 		return 0;
 
 	if (!btf_id) {
@@ -4751,8 +4782,21 @@ static int check_attach_btf_id(struct bpf_verifier_env *env)
 		prog->aux->attach_func_proto = t;
 		prog->aux->attach_btf_trace = true;
 		return 0;
+	default:
+		if (!prog_extension)
+			return -EINVAL;
+		/* fallthrough */
+	case BPF_MODIFY_RETURN:
+	case BPF_LSM_MAC:
 	case BPF_TRACE_FENTRY:
 	case BPF_TRACE_FEXIT:
+		prog->aux->attach_func_name = tname;
+		if (prog->type == BPF_PROG_TYPE_LSM) {
+			ret = bpf_lsm_verify_prog(&env->log, prog);
+			if (ret < 0)
+				return ret;
+		}
+
 		if (!btf_type_is_func(t)) {
 			verbose(env, "attach_btf_id %u is not a function\n",
 				btf_id);
@@ -4764,7 +4808,7 @@ static int check_attach_btf_id(struct bpf_verifier_env *env)
 		tr = bpf_trampoline_lookup(btf_id);
 		if (!tr)
 			return -ENOMEM;
-		prog->aux->attach_func_name = tname;
+		/* t is either vmlinux type or another program's type */
 		prog->aux->attach_func_proto = t;
 		mutex_lock(&tr->mutex);
 		if (tr->func.addr) {

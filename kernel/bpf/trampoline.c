@@ -3,6 +3,16 @@
 #include <linux/hash.h>
 #include <linux/bpf.h>
 #include <linux/filter.h>
+#include <linux/ftrace.h>
+#include <linux/rbtree_latch.h>
+#include <linux/perf_event.h>
+#include <linux/btf.h>
+
+/* dummy _ops. The verifier will operate on target program's ops. */
+const struct bpf_verifier_ops bpf_extension_verifier_ops = {
+};
+const struct bpf_prog_ops bpf_extension_prog_ops = {
+};
 
 /* btf_vmlinux has ~22k attachable functions. 1k htab is enough. */
 #define TRAMPOLINE_HASH_BITS 10
@@ -118,11 +128,23 @@ out:
 	return err;
 }
 
-static enum bpf_tramp_prog_type bpf_attach_type_to_tramp(enum bpf_attach_type t)
+static enum bpf_tramp_prog_type bpf_attach_type_to_tramp(struct bpf_prog *prog)
 {
-	switch (t) {
+	switch (prog->expected_attach_type) {
 	case BPF_TRACE_FENTRY:
 		return BPF_TRAMP_FENTRY;
+	case BPF_MODIFY_RETURN:
+		return BPF_TRAMP_MODIFY_RETURN;
+	case BPF_TRACE_FEXIT:
+		return BPF_TRAMP_FEXIT;
+	case BPF_LSM_MAC:
+		if (!prog->aux->attach_func_proto->type)
+			/* The function returns void, we cannot modify its
+			 * return value.
+			 */
+			return BPF_TRAMP_FEXIT;
+		else
+			return BPF_TRAMP_MODIFY_RETURN;
 	default:
 		return BPF_TRAMP_FEXIT;
 	}
@@ -135,7 +157,7 @@ int bpf_trampoline_link_prog(struct bpf_prog *prog)
 	int err = 0;
 
 	tr = prog->aux->trampoline;
-	kind = bpf_attach_type_to_tramp(prog->expected_attach_type);
+	kind = bpf_attach_type_to_tramp(prog);
 	mutex_lock(&tr->mutex);
 	if (tr->progs_cnt[BPF_TRAMP_FENTRY] + tr->progs_cnt[BPF_TRAMP_FEXIT]
 	    >= BPF_MAX_TRAMP_PROGS) {
@@ -167,7 +189,7 @@ int bpf_trampoline_unlink_prog(struct bpf_prog *prog)
 	int err;
 
 	tr = prog->aux->trampoline;
-	kind = bpf_attach_type_to_tramp(prog->expected_attach_type);
+	kind = bpf_attach_type_to_tramp(prog);
 	mutex_lock(&tr->mutex);
 	hlist_del(&prog->aux->tramp_hlist);
 	tr->progs_cnt[kind]--;
